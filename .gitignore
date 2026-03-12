@@ -53,3 +53,5 @@ coverage/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+
+.dev.vars
