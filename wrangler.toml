@@ -1,0 +1,13 @@
+name = "autoclaw-worker"
+main = "src/index.ts"
+compatibility_date = "2024-12-30"
+
+# Environment variables — set via `wrangler secret put <KEY>`
+# DATABASE_URL, HUNTER_API_KEY, SNOV_API_ID, SNOV_API_SECRET,
+# BREVO_API_KEY, WORKER_AUTH_SECRET, CEREBRAS_API_KEY
+
+[vars]
+ENVIRONMENT = "production"
+
+# Daily execution is triggered by existing cron worker calling POST /cron
+# No cron trigger needed here — use existing cron infrastructure
