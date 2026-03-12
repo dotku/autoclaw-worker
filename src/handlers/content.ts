@@ -4,10 +4,32 @@ import { claudeCompletion } from "../lib/ai";
 
 interface Env {
   DATABASE_URL: string;
-  IRIS_LIMO_DATABASE_URL?: string;
+  CONTENT_DATABASE_URL?: string;
+  CONTENT_DEFAULT_BRAND_NAME?: string;
+  CONTENT_DEFAULT_BRAND_DOMAIN?: string;
+  CONTENT_DEFAULT_CONTACT_PHONE?: string;
+  CONTENT_DEFAULT_AUDIENCE?: string;
+  CONTENT_DEFAULT_MARKET_REGION?: string;
   AI_GATEWAY_API_KEY?: string;
   ANTHROPIC_API_KEY?: string;
   CEREBRAS_API_KEY?: string;
+}
+
+interface ContentConfig {
+  content_db_url?: string;
+  brand_name?: string;
+  brand_domain?: string;
+  contact_phone?: string;
+  audience?: string;
+  market_region?: string;
+  profile?: {
+    brand_name?: string;
+    brand_domain?: string;
+    contact_phone?: string;
+    audience?: string;
+    market_region?: string;
+  };
+  [key: string]: unknown;
 }
 
 // Topics pool — rotate through these for weekly content
@@ -120,14 +142,49 @@ function pickCover(theme: string, weekNumber: number): string {
   return images[weekNumber % images.length];
 }
 
-// Task 0: Generate a blog article and insert into iris-limo DB
-async function generateArticle(env: Env, agentId: number, config: Record<string, unknown>) {
+function getContentProfile(env: Env, config: ContentConfig) {
+  const profile = config.profile || {};
+  return {
+    brandName:
+      profile.brand_name ||
+      config.brand_name ||
+      env.CONTENT_DEFAULT_BRAND_NAME ||
+      "Your Brand",
+    brandDomain:
+      profile.brand_domain ||
+      config.brand_domain ||
+      env.CONTENT_DEFAULT_BRAND_DOMAIN ||
+      "example.com",
+    contactPhone:
+      profile.contact_phone ||
+      config.contact_phone ||
+      env.CONTENT_DEFAULT_CONTACT_PHONE ||
+      "+1-000-000-0000",
+    audience:
+      profile.audience ||
+      config.audience ||
+      env.CONTENT_DEFAULT_AUDIENCE ||
+      "本地中文用户",
+    marketRegion:
+      profile.market_region ||
+      config.market_region ||
+      env.CONTENT_DEFAULT_MARKET_REGION ||
+      "你的目标城市",
+  };
+}
+
+// Task 0: Generate a blog article and insert into content DB
+async function generateArticle(env: Env, agentId: number, config: ContentConfig) {
   await updateTaskStatus(env.DATABASE_URL, agentId, 0, "in_progress");
 
-  const irisDbUrl = env.IRIS_LIMO_DATABASE_URL || (config.iris_limo_db_url as string) || "";
-  if (!irisDbUrl) {
-    await updateTaskStatus(env.DATABASE_URL, agentId, 0, "completed", "IRIS_LIMO_DATABASE_URL not configured");
-    return { error: "IRIS_LIMO_DATABASE_URL not configured" };
+  const contentDbUrl =
+    env.CONTENT_DATABASE_URL ||
+    config.content_db_url ||
+    "";
+  if (!contentDbUrl) {
+    const msg = "CONTENT_DATABASE_URL not configured";
+    await updateTaskStatus(env.DATABASE_URL, agentId, 0, "completed", msg);
+    return { error: msg };
   }
 
   // Determine which topic to write about based on current week
@@ -135,7 +192,9 @@ async function generateArticle(env: Env, agentId: number, config: Record<string,
   const { theme, angle } = pickTopic(weekNumber);
   const cover = pickCover(theme, weekNumber);
 
-  const prompt = `你是爱丽丝专车(Iris Limo)的内容运营，专门为旧金山湾区华人写出行攻略。
+  const { brandName, brandDomain, contactPhone, audience, marketRegion } = getContentProfile(env, config);
+
+  const prompt = `你是 ${brandName} 的内容运营，服务 ${marketRegion} 的 ${audience}。
 
 请写一篇小红书风格的攻略文章：
 
@@ -146,8 +205,8 @@ async function generateArticle(env: Env, agentId: number, config: Record<string,
 1. 标题用emoji开头，吸引点击，15字以内
 2. 正文800-1200字，分段清晰，多用emoji和符号排版
 3. 内容要实用、接地气，像朋友分享经验
-4. 自然融入爱丽丝专车服务（不要太硬广）
-5. 文末加上联系方式：📞 (415) 610-7366 🌐 iris-limo.jytech.us
+4. 自然融入 ${brandName} 的服务（不要太硬广）
+5. 文末加上联系方式：📞 ${contactPhone} 🌐 ${brandDomain}
 6. 最后加5-8个相关hashtag，用#开头
 
 请直接输出，格式：
@@ -164,12 +223,12 @@ async function generateArticle(env: Env, agentId: number, config: Record<string,
     const body = lines.slice(1).join("\n").trim();
 
     // Get next sort_order
-    const irisSql = neon(irisDbUrl);
-    const maxRows = await irisSql`SELECT COALESCE(MAX(sort_order), 0) + 1 as next_sort FROM xhs_notes`;
+    const contentSql = neon(contentDbUrl);
+    const maxRows = await contentSql`SELECT COALESCE(MAX(sort_order), 0) + 1 as next_sort FROM xhs_notes`;
     const nextSort = maxRows[0].next_sort as number;
 
     // Insert article
-    const rows = await irisSql`
+    const rows = await contentSql`
       INSERT INTO xhs_notes (title, cover, url, likes, content, images, sort_order)
       VALUES (${title}, ${cover}, ${"https://www.xiaohongshu.com/explore/"}, ${"0"}, ${body}, ${"[]"}, ${nextSort})
       RETURNING id
@@ -196,12 +255,12 @@ async function generateArticle(env: Env, agentId: number, config: Record<string,
 }
 
 // Task 1: Publish to backlink platforms (future)
-async function publishBacklinks(env: Env, agentId: number, config: Record<string, unknown>) {
+async function publishBacklinks(env: Env, agentId: number, config: ContentConfig) {
   await updateTaskStatus(env.DATABASE_URL, agentId, 1, "in_progress");
 
   // TODO: integrate with xpilot SEO backlinks skill
   // - Blogger, Medium, Dev.to, Telegra.ph, WordPress
-  // - Each post links back to iris-limo.jytech.us/blog/[id]
+  // - Each post links back to {brand_domain}/blog/[id]
 
   const summary = "Backlink publishing: not yet implemented";
   await updateTaskStatus(env.DATABASE_URL, agentId, 1, "completed", summary);
@@ -214,11 +273,12 @@ export async function handleContent(
   taskIndex: number,
   config: Record<string, unknown>
 ) {
+  const contentConfig = config as ContentConfig;
   switch (taskIndex) {
     case 0:
-      return generateArticle(env, agentId, config);
+      return generateArticle(env, agentId, contentConfig);
     case 1:
-      return publishBacklinks(env, agentId, config);
+      return publishBacklinks(env, agentId, contentConfig);
     default:
       return { error: `Task ${taskIndex} not implemented` };
   }

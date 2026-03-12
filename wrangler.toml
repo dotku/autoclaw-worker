@@ -3,11 +3,19 @@ main = "src/index.ts"
 compatibility_date = "2024-12-30"
 
 # Environment variables — set via `wrangler secret put <KEY>`
-# DATABASE_URL, HUNTER_API_KEY, SNOV_API_ID, SNOV_API_SECRET,
-# BREVO_API_KEY, WORKER_AUTH_SECRET, CEREBRAS_API_KEY
+# Required:
+# - DATABASE_URL
+# - WORKER_AUTH_SECRET
+#
+# Optional integrations:
+# - CONTENT_DATABASE_URL (for content_gen agent)
+# - HUNTER_API_KEY, SNOV_API_ID, SNOV_API_SECRET, BREVO_API_KEY
+# - AI_GATEWAY_API_KEY, ANTHROPIC_API_KEY, CEREBRAS_API_KEY
+# - GITHUB_TOKEN
 
 [vars]
 ENVIRONMENT = "production"
 
-# Daily execution is triggered by existing cron worker calling POST /cron
-# No cron trigger needed here — use existing cron infrastructure
+# This template does not set a native Cloudflare cron trigger by default.
+# You can call POST /cron from an external scheduler (Vercel cron, GitHub Actions, etc.)
+# or add [triggers] in this file if you want Cloudflare native scheduling.

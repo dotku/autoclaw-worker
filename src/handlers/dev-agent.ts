@@ -5,44 +5,103 @@ interface Env {
   DATABASE_URL: string;
   CEREBRAS_API_KEY?: string;
   GITHUB_TOKEN?: string;
+  DEV_AGENT_DEFAULT_REPO?: string;
+  DEV_AGENT_DEFAULT_PRODUCT_NAME?: string;
+  DEV_AGENT_DEFAULT_PRODUCT_DESCRIPTION?: string;
+  DEV_AGENT_DEFAULT_WEBSITE?: string;
+  DEV_AGENT_DEFAULT_TECH_STACK?: string;
 }
 
 interface DevAgentConfig {
-  repo: string; // e.g. "dotku/gpulaw-attorney-services"
+  repo?: string; // e.g. "owner/repository"
   website?: string;
   competitors?: string[];
   focus_areas?: string[];
   tech_stack?: string;
+  product_name?: string;
+  product_description?: string;
+  current_features?: string[];
+  missing_features?: string[];
+  profile?: {
+    repo?: string;
+    product_name?: string;
+    product_description?: string;
+    website?: string;
+    tech_stack?: string;
+  };
   [key: string]: unknown;
 }
 
-// Task 0: Competitor Research — analyze legal tech competitors
+function getProductContext(env: Env, config: DevAgentConfig) {
+  const profile = config.profile || {};
+  return {
+    productName:
+      profile.product_name ||
+      config.product_name ||
+      env.DEV_AGENT_DEFAULT_PRODUCT_NAME ||
+      "Your Product",
+    website:
+      profile.website ||
+      config.website ||
+      env.DEV_AGENT_DEFAULT_WEBSITE ||
+      "https://example.com",
+    productDescription:
+      profile.product_description ||
+      config.product_description ||
+      env.DEV_AGENT_DEFAULT_PRODUCT_DESCRIPTION ||
+      "A SaaS product that needs competitive and technical planning support.",
+    techStack:
+      profile.tech_stack ||
+      config.tech_stack ||
+      env.DEV_AGENT_DEFAULT_TECH_STACK ||
+      "Next.js 16, React 19, TypeScript, Prisma 7, PostgreSQL (Neon), Auth0, OpenAI GPT-4, next-intl (en/zh-CN/zh-TW), Tailwind CSS v4",
+    currentFeatures: config.current_features || [
+      "Core user authentication",
+      "Dashboard and reporting",
+      "Basic integrations",
+    ],
+    missingFeatures: config.missing_features || [
+      "Monetization and billing integration",
+      "Advanced onboarding and profile workflows",
+      "Automated notification pipeline",
+    ],
+  };
+}
+
+function getRepoOrError(env: Env, config: DevAgentConfig): { repo?: string; error?: string } {
+  const profile = config.profile || {};
+  const repo = profile.repo || config.repo || env.DEV_AGENT_DEFAULT_REPO;
+  if (!repo) {
+    return { error: "repo is required in agent config (format: owner/repository)" };
+  }
+  return { repo };
+}
+
+// Task 0: Competitor Research — analyze configurable market competitors
 async function competitorResearch(env: Env, agentId: number, config: DevAgentConfig) {
   await updateTaskStatus(env.DATABASE_URL, agentId, 0, "in_progress");
+  const product = getProductContext(env, config);
 
   const competitors = config.competitors || [
-    "Clio (clio.com) — practice management, billing, client intake",
-    "LegalZoom (legalzoom.com) — document filing, business formation, attorney matching",
-    "Rocket Lawyer (rocketlawyer.com) — document automation, legal plans, attorney consultations",
-    "DoNotPay (donotpay.com) — AI legal assistant, consumer rights automation",
-    "Harvey AI (harvey.ai) — AI legal research, document drafting for law firms",
-    "CaseMark (casemark.ai) — AI document summarization, deposition analysis",
-    "Ironclad (ironcladapp.com) — contract lifecycle management, AI review",
-    "Luminance (luminance.com) — AI contract analysis, due diligence",
+    "Primary direct competitor in your niche",
+    "Low-cost alternative in your niche",
+    "Enterprise-focused competitor",
+    "AI-first emerging competitor",
+    "Marketplace/platform alternative",
   ];
 
   const focusAreas = config.focus_areas || [
     "user registration & onboarding flow",
     "subscription/payment tiers & pricing",
-    "AI-powered legal tools",
-    "lawyer marketplace & matching",
-    "document management & collaboration",
-    "client portal & case tracking",
+    "core product workflow quality",
+    "integration ecosystem & APIs",
+    "data/reporting experience",
+    "team collaboration & permissions",
     "mobile experience",
     "multilingual support",
   ];
 
-  const prompt = `You are a senior product analyst specializing in legal tech. Conduct a detailed competitive analysis for GPULaw Attorney Services (${config.website || "gpulaw.jytech.us"}).
+  const prompt = `You are a senior product analyst. Conduct a detailed competitive analysis for ${product.productName} (${product.website}).
 
 COMPETITORS TO ANALYZE:
 ${competitors.map((c) => `- ${c}`).join("\n")}
@@ -50,22 +109,14 @@ ${competitors.map((c) => `- ${c}`).join("\n")}
 FOCUS AREAS:
 ${focusAreas.map((f) => `- ${f}`).join("\n")}
 
-CURRENT GPULAW FEATURES:
-- AI Document Analyzer (contract analysis, fact extraction)
-- AI Legal Researcher (jurisdiction-specific research)
-- AI Document Drafter (contracts, motions, briefs)
-- AI Document Reviewer (issue detection, scoring)
-- Auth0 authentication (basic)
-- Prisma + PostgreSQL database
-- 3 language support (en, zh-CN, zh-TW)
-- Dashboard with case management
+PRODUCT DESCRIPTION:
+${product.productDescription}
+
+CURRENT FEATURES:
+${product.currentFeatures.map((f) => `- ${f}`).join("\n")}
 
 MISSING/INCOMPLETE:
-- Stripe payment integration (stub only)
-- User profile completion pages
-- Lawyer verification workflow UI
-- Email notification system
-- Document storage (S3)
+${product.missingFeatures.map((f) => `- ${f}`).join("\n")}
 
 For each competitor, provide:
 1. **Key Features** we're missing
@@ -100,6 +151,7 @@ Format as structured markdown. Be specific and actionable.`;
 // Task 1: Feature Gap Analysis — compare and prioritize
 async function featureGapAnalysis(env: Env, agentId: number, config: DevAgentConfig) {
   await updateTaskStatus(env.DATABASE_URL, agentId, 1, "in_progress");
+  const product = getProductContext(env, config);
 
   const sql = getDb(env.DATABASE_URL);
 
@@ -115,13 +167,16 @@ async function featureGapAnalysis(env: Env, agentId: number, config: DevAgentCon
     ? (latestResearch[0].summary as string)
     : "No prior competitor research available.";
 
-  const prompt = `You are a technical product manager for GPULaw Attorney Services, an AI-powered legal tech platform.
+  const prompt = `You are a technical product manager for ${product.productName}.
 
 COMPETITOR RESEARCH:
 ${researchContext.substring(0, 3000)}
 
+PRODUCT DESCRIPTION:
+${product.productDescription}
+
 CURRENT TECH STACK:
-${config.tech_stack || "Next.js 16, React 19, TypeScript, Prisma 7, PostgreSQL (Neon), Auth0, OpenAI GPT-4, next-intl (en/zh-CN/zh-TW), Tailwind CSS v4"}
+${product.techStack}
 
 Based on the competitor analysis, create a detailed feature gap analysis with implementation plans:
 
@@ -136,10 +191,10 @@ Based on the competitor analysis, create a detailed feature gap analysis with im
 
 ## Focus especially on:
 1. **User System Enhancement**: Profile pages, onboarding flow, role-based dashboards
-2. **Payment Integration**: Stripe checkout, subscription plans, billing management
-3. **Lawyer Marketplace**: Matching algorithm, availability calendar, booking flow
-4. **Document Management**: Upload/storage, version history, sharing
-5. **Notifications**: Email, in-app, webhooks
+2. **Payment Integration**: checkout, subscription plans, billing management
+3. **Core Workflow Automation**: the product's primary use-case workflow
+4. **Data Management**: upload/storage, version history, sharing
+5. **Notifications**: email, in-app, webhooks
 
 Produce a structured sprint plan with 2-week sprints. Format as markdown with clear sections.`;
 
@@ -162,6 +217,11 @@ Produce a structured sprint plan with 2-week sprints. Format as markdown with cl
 // Task 2: Create GitHub Issues — auto-create issues from gap analysis
 async function createGitHubIssues(env: Env, agentId: number, config: DevAgentConfig) {
   await updateTaskStatus(env.DATABASE_URL, agentId, 2, "in_progress");
+  const repoInfo = getRepoOrError(env, config);
+  if (repoInfo.error) {
+    await updateTaskStatus(env.DATABASE_URL, agentId, 2, "completed", repoInfo.error);
+    return { error: repoInfo.error };
+  }
 
   if (!env.GITHUB_TOKEN) {
     const msg = "GITHUB_TOKEN not configured — cannot create issues";
@@ -204,7 +264,7 @@ Return a JSON array (no markdown, pure JSON) with exactly 5 items:
 ]
 
 Priority labels: priority-p0, priority-p1, priority-p2
-Category labels: user-system, payment, marketplace, documents, notifications
+Category labels: user-system, payment, workflow, data, notifications
 Always include "auto-generated" label.`;
 
   try {
@@ -224,7 +284,7 @@ Always include "auto-generated" label.`;
       labels: string[];
     }[];
 
-    const repo = config.repo || "dotku/gpulaw-attorney-services";
+    const repo = repoInfo.repo as string;
     const createdIssues: { number: number; title: string; url: string }[] = [];
 
     for (const issue of issues.slice(0, 5)) {
@@ -235,11 +295,11 @@ Always include "auto-generated" label.`;
             Authorization: `Bearer ${env.GITHUB_TOKEN}`,
             Accept: "application/vnd.github.v3+json",
             "Content-Type": "application/json",
-            "User-Agent": "OpenClaw-DevAgent",
+            "User-Agent": "Autoclaw-Worker-DevAgent",
           },
           body: JSON.stringify({
             title: `[AutoDev] ${issue.title}`,
-            body: `${issue.body}\n\n---\n_Auto-generated by OpenClaw Dev Agent based on competitor analysis_`,
+            body: `${issue.body}\n\n---\n_Auto-generated by Worker Dev Agent based on competitor analysis_`,
             labels: [...(issue.labels || []), "auto-generated"],
           }),
         });
@@ -275,6 +335,11 @@ Always include "auto-generated" label.`;
 // Task 3: Generate Implementation Code — produce code for top priority issue
 async function generateImplementation(env: Env, agentId: number, config: DevAgentConfig) {
   await updateTaskStatus(env.DATABASE_URL, agentId, 3, "in_progress");
+  const repoInfo = getRepoOrError(env, config);
+  if (repoInfo.error) {
+    await updateTaskStatus(env.DATABASE_URL, agentId, 3, "completed", repoInfo.error);
+    return { error: repoInfo.error };
+  }
 
   if (!env.GITHUB_TOKEN) {
     const msg = "GITHUB_TOKEN not configured — cannot create PRs";
@@ -282,7 +347,7 @@ async function generateImplementation(env: Env, agentId: number, config: DevAgen
     return { error: msg };
   }
 
-  const repo = config.repo || "dotku/gpulaw-attorney-services";
+  const repo = repoInfo.repo as string;
 
   // Get the latest gap analysis for context
   const sql = getDb(env.DATABASE_URL);
@@ -301,7 +366,7 @@ async function generateImplementation(env: Env, agentId: number, config: DevAgen
         headers: {
           Authorization: `Bearer ${env.GITHUB_TOKEN}`,
           Accept: "application/vnd.github.v3+json",
-          "User-Agent": "OpenClaw-DevAgent",
+          "User-Agent": "Autoclaw-Worker-DevAgent",
         },
       }
     );
@@ -364,10 +429,10 @@ Be specific with file paths and code. Use TypeScript, Auth0 for auth, Prisma for
         Authorization: `Bearer ${env.GITHUB_TOKEN}`,
         Accept: "application/vnd.github.v3+json",
         "Content-Type": "application/json",
-        "User-Agent": "OpenClaw-DevAgent",
+        "User-Agent": "Autoclaw-Worker-DevAgent",
       },
       body: JSON.stringify({
-        body: `## Auto-Generated Implementation Plan\n\n${planResponse}\n\n---\n_Generated by OpenClaw Dev Agent. Review and implement via PR._`,
+        body: `## Auto-Generated Implementation Plan\n\n${planResponse}\n\n---\n_Generated by Worker Dev Agent. Review and implement via PR._`,
       }),
     });
 
@@ -389,9 +454,11 @@ Be specific with file paths and code. Use TypeScript, Auth0 for auth, Prisma for
 // Task 4: Sprint Progress Report
 async function sprintReport(env: Env, agentId: number, config: DevAgentConfig) {
   await updateTaskStatus(env.DATABASE_URL, agentId, 4, "in_progress");
+  const product = getProductContext(env, config);
+  const repoInfo = getRepoOrError(env, config);
 
   const sql = getDb(env.DATABASE_URL);
-  const repo = config.repo || "dotku/gpulaw-attorney-services";
+  const repo = repoInfo.repo;
 
   // Get all dev agent reports
   const reports = await sql`
@@ -404,7 +471,7 @@ async function sprintReport(env: Env, agentId: number, config: DevAgentConfig) {
 
   // Get GitHub issues status if token available
   let issuesSummary = "GitHub token not available";
-  if (env.GITHUB_TOKEN) {
+  if (env.GITHUB_TOKEN && repo) {
     try {
       const openRes = await fetch(
         `https://api.github.com/repos/${repo}/issues?labels=auto-generated&state=open&per_page=100`,
@@ -412,7 +479,7 @@ async function sprintReport(env: Env, agentId: number, config: DevAgentConfig) {
           headers: {
             Authorization: `Bearer ${env.GITHUB_TOKEN}`,
             Accept: "application/vnd.github.v3+json",
-            "User-Agent": "OpenClaw-DevAgent",
+            "User-Agent": "Autoclaw-Worker-DevAgent",
           },
         }
       );
@@ -422,7 +489,7 @@ async function sprintReport(env: Env, agentId: number, config: DevAgentConfig) {
           headers: {
             Authorization: `Bearer ${env.GITHUB_TOKEN}`,
             Accept: "application/vnd.github.v3+json",
-            "User-Agent": "OpenClaw-DevAgent",
+            "User-Agent": "Autoclaw-Worker-DevAgent",
           },
         }
       );
@@ -441,7 +508,7 @@ async function sprintReport(env: Env, agentId: number, config: DevAgentConfig) {
     `- [${r.task_name}] ${(r.summary as string)?.substring(0, 150)} (${r.created_at})`
   ).join("\n");
 
-  const prompt = `Generate a sprint progress report for GPULaw Attorney Services development automation.
+  const prompt = `Generate a sprint progress report for ${product.productName} development automation.
 
 DEV AGENT ACTIVITY:
 ${reportContext || "No prior activity"}
@@ -449,10 +516,10 @@ ${reportContext || "No prior activity"}
 GITHUB ISSUES STATUS:
 ${issuesSummary}
 
-PROJECT: ${repo}
-WEBSITE: ${config.website || "gpulaw.jytech.us"}
+PROJECT: ${repo || "not configured"}
+WEBSITE: ${product.website}
 
-Generate a concise sprint report with:
+Generate a concise sprint report for ${product.productName} with:
 1. **Sprint Summary** — what was accomplished
 2. **Competitor Insights** — key takeaways from research
 3. **Development Progress** — issues created, code generated

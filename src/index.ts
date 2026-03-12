@@ -18,7 +18,17 @@ export interface Env {
   AI_GATEWAY_API_KEY?: string;
   ANTHROPIC_API_KEY?: string;
   CEREBRAS_API_KEY?: string;
-  IRIS_LIMO_DATABASE_URL?: string;
+  CONTENT_DATABASE_URL?: string;
+  CONTENT_DEFAULT_BRAND_NAME?: string;
+  CONTENT_DEFAULT_BRAND_DOMAIN?: string;
+  CONTENT_DEFAULT_CONTACT_PHONE?: string;
+  CONTENT_DEFAULT_AUDIENCE?: string;
+  CONTENT_DEFAULT_MARKET_REGION?: string;
+  DEV_AGENT_DEFAULT_REPO?: string;
+  DEV_AGENT_DEFAULT_PRODUCT_NAME?: string;
+  DEV_AGENT_DEFAULT_PRODUCT_DESCRIPTION?: string;
+  DEV_AGENT_DEFAULT_WEBSITE?: string;
+  DEV_AGENT_DEFAULT_TECH_STACK?: string;
   GITHUB_TOKEN?: string;
 }
 
@@ -219,7 +229,12 @@ export default {
           );
 
           if (nextIdx === -1) {
-            results.push({ agent_id: agent.id as number, type: agent.agent_type as string, task: "全部完成", status: "skipped" });
+            results.push({
+              agent_id: agent.id as number,
+              type: agent.agent_type as string,
+              task: "all tasks completed",
+              status: "skipped",
+            });
             continue;
           }
 
@@ -257,7 +272,7 @@ export default {
                 taskResult = await handleSocial(env, agentId, nextIdx, config);
                 break;
               default:
-                taskResult = { error: `${agentType} 暂不支持` };
+                taskResult = { error: `${agentType} is not supported yet` };
             }
             results.push({ agent_id: agentId, type: agentType, task: tasks[nextIdx].name, status: "completed" });
           } catch (e) {

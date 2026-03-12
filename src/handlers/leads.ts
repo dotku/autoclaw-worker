@@ -99,18 +99,30 @@ async function buildLeadList(env: Env, agentId: number, domains: string[], proje
     }
   }
 
-  // Batch insert using a single SQL statement with VALUES list
+  // Insert leads with parameterized statements (avoids SQL string building and type issues)
   if (uniqueLeads.length > 0) {
-    const values = uniqueLeads.map((l) =>
-      `(${projectId}, ${userId}, '${l.email.replace(/'/g, "''")}', '${l.firstName.replace(/'/g, "''")}', '${l.lastName.replace(/'/g, "''")}', '${l.company.replace(/'/g, "''")}', '${l.position.replace(/'/g, "''")}', '${l.source}', '${domain}', ${l.confidence || 'NULL'}, ${l.verified || false})`
-    ).join(",\n");
-
     try {
-      await sql`INSERT INTO leads (project_id, user_id, email, first_name, last_name, company, position, source, domain, confidence, verified)
-        VALUES ${sql.unsafe(values)}
-        ON CONFLICT (project_id, email) DO NOTHING`;
+      for (const l of uniqueLeads) {
+        await sql`
+          INSERT INTO leads (project_id, user_id, email, first_name, last_name, company, position, source, domain, confidence, verified)
+          VALUES (
+            ${projectId},
+            ${userId},
+            ${l.email},
+            ${l.firstName},
+            ${l.lastName},
+            ${l.company},
+            ${l.position},
+            ${l.source},
+            ${domain},
+            ${l.confidence ?? null},
+            ${l.verified ?? false}
+          )
+          ON CONFLICT (project_id, email) DO NOTHING
+        `;
+      }
     } catch (e) {
-      console.error("Batch insert error:", e);
+      console.error("Lead insert error:", e);
     }
   }
 
