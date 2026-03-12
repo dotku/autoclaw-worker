@@ -14,7 +14,7 @@ compatibility_date = "2024-12-30"
 # - GITHUB_TOKEN
 
 [vars]
-ENVIRONMENT = "production"
+ENVIRONMENT = "development"
 
 # This template does not set a native Cloudflare cron trigger by default.
 # You can call POST /cron from an external scheduler (Vercel cron, GitHub Actions, etc.)
