@@ -2,6 +2,8 @@
 
 interface CerebrasEnv {
   CEREBRAS_API_KEY?: string;
+  ALIBABA_API_KEY?: string;
+  ALIBABA_AI_BASE_URL?: string;
 }
 
 interface ClaudeEnv {
@@ -9,8 +11,14 @@ interface ClaudeEnv {
   ANTHROPIC_API_KEY?: string;
 }
 
-// Fast & cheap — for SEO keyword research, ICP analysis, etc.
-export async function cerebrasCompletion(
+type SupportedModel =
+  | "auto"
+  | "cerebras/gpt-oss-120b"
+  | "anthropic/claude-sonnet-4.5"
+  | "alibaba/qwen-plus"
+  | "alibaba/qwen-turbo";
+
+async function runCerebras(
   env: CerebrasEnv,
   prompt: string,
   maxTokens = 1500
@@ -39,8 +47,7 @@ export async function cerebrasCompletion(
   return data.choices[0].message.content;
 }
 
-// High quality — for writing emails, marketing copy
-export async function claudeCompletion(
+async function runClaude(
   env: ClaudeEnv,
   prompt: string,
   maxTokens = 2000
@@ -100,4 +107,109 @@ export async function claudeCompletion(
   }
 
   throw new Error("No Claude API key configured (AI_GATEWAY_API_KEY or ANTHROPIC_API_KEY)");
+}
+
+async function runAlibaba(
+  env: CerebrasEnv,
+  prompt: string,
+  model: "qwen-plus" | "qwen-turbo",
+  maxTokens = 2000
+): Promise<string> {
+  if (!env.ALIBABA_API_KEY) {
+    throw new Error("Alibaba API key is invalid or missing. Add a valid Alibaba key in Settings > Market before using Qwen models.");
+  }
+
+  const baseUrl = env.ALIBABA_AI_BASE_URL || "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
+  const res = await fetch(`${baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${env.ALIBABA_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: maxTokens,
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Alibaba API error ${res.status}: ${err}`);
+  }
+
+  const data = (await res.json()) as {
+    choices: { message: { content: string } }[];
+  };
+  return data.choices[0]?.message?.content || "";
+}
+
+// Fast & cheap by default — for SEO keyword research, ICP analysis, etc.
+export async function cerebrasCompletion(
+  env: CerebrasEnv & ClaudeEnv,
+  prompt: string,
+  maxTokens = 1500,
+  preferredModel = "auto"
+): Promise<string> {
+  const model = preferredModel as SupportedModel;
+
+  if (model === "anthropic/claude-sonnet-4.5") {
+    try {
+      return await runClaude(env, prompt, maxTokens);
+    } catch {
+      // Fall through to the default analysis model.
+    }
+  }
+
+  if (model === "alibaba/qwen-plus" || model === "alibaba/qwen-turbo") {
+    try {
+      return await runAlibaba(env, prompt, model === "alibaba/qwen-plus" ? "qwen-plus" : "qwen-turbo", maxTokens);
+    } catch {
+      // Fall through to the default analysis model.
+    }
+  }
+
+  try {
+    return await runCerebras(env, prompt, maxTokens);
+  } catch {
+    if (model !== "cerebras/gpt-oss-120b") {
+      return await runClaude(env, prompt, maxTokens);
+    }
+    throw new Error("Preferred model unavailable: cerebras/gpt-oss-120b");
+  }
+}
+
+// High quality by default — for writing emails, marketing copy
+export async function claudeCompletion(
+  env: ClaudeEnv & CerebrasEnv,
+  prompt: string,
+  maxTokens = 2000,
+  preferredModel = "auto"
+): Promise<string> {
+  const model = preferredModel as SupportedModel;
+
+  if (model === "cerebras/gpt-oss-120b") {
+    try {
+      return await runCerebras(env, prompt, maxTokens);
+    } catch {
+      // Fall through to the default writing model.
+    }
+  }
+
+  if (model === "alibaba/qwen-plus" || model === "alibaba/qwen-turbo") {
+    try {
+      return await runAlibaba(env, prompt, model === "alibaba/qwen-plus" ? "qwen-plus" : "qwen-turbo", maxTokens);
+    } catch {
+      // Fall through to the default writing model.
+    }
+  }
+
+  try {
+    return await runClaude(env, prompt, maxTokens);
+  } catch {
+    if (model !== "anthropic/claude-sonnet-4.5") {
+      return await runCerebras(env, prompt, maxTokens);
+    }
+    throw new Error("Preferred model unavailable: anthropic/claude-sonnet-4.5");
+  }
 }

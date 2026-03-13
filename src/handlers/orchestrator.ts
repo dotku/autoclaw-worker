@@ -20,34 +20,66 @@ interface AgentStatus {
   agent_type: string;
   status: string;
   config: Record<string, unknown>;
+  project_id?: number;
   project_name: string;
   project_website: string;
 }
 
-// Task 0: Collect and analyze all agent reports across projects
-async function analyzeAgentReports(env: Env, agentId: number) {
+interface ProjectContext {
+  projectId: number;
+  projectName: string;
+  projectWebsite: string;
+  projectDescription?: string;
+}
+
+async function getProjectContext(env: Env, agentId: number): Promise<ProjectContext> {
+  const sql = getDb(env.DATABASE_URL);
+  const rows = await sql`
+    SELECT p.id as project_id, p.name as project_name, p.website as project_website, p.description as project_description
+    FROM agent_assignments aa
+    JOIN projects p ON aa.project_id = p.id
+    WHERE aa.id = ${agentId}
+    LIMIT 1
+  `;
+
+  if (rows.length === 0) {
+    throw new Error("Project context not found for orchestrator agent");
+  }
+
+  return {
+    projectId: rows[0].project_id as number,
+    projectName: rows[0].project_name as string,
+    projectWebsite: (rows[0].project_website as string) || "",
+    projectDescription: (rows[0].project_description as string) || "",
+  };
+}
+
+// Task 0: Collect and analyze agent reports for this project only
+async function analyzeAgentReports(env: Env, agentId: number, project: ProjectContext) {
   await updateTaskStatus(env.DATABASE_URL, agentId, 0, "in_progress");
 
   const sql = getDb(env.DATABASE_URL);
 
-  // Get all recent agent reports (last 7 days)
+  // Get recent agent reports for this project only.
   const reports = (await sql`
     SELECT ar.agent_type, ar.task_name, ar.summary, ar.metrics, ar.created_at,
            p.name as project_name
     FROM agent_reports ar
     JOIN projects p ON ar.project_id = p.id
-    WHERE ar.created_at > NOW() - INTERVAL '7 days'
+    WHERE ar.project_id = ${project.projectId}
+      AND ar.created_at > NOW() - INTERVAL '7 days'
     ORDER BY ar.created_at DESC
     LIMIT 50
   `) as unknown as AgentReport[];
 
-  // Get all active agents and their status
+  // Get active agents and their status for this project only.
   const activeAgents = (await sql`
-    SELECT aa.id, aa.agent_type, aa.status, aa.config,
+    SELECT aa.id, aa.agent_type, aa.status, aa.config, aa.project_id,
            p.name as project_name, p.website as project_website
     FROM agent_assignments aa
     JOIN projects p ON aa.project_id = p.id
     WHERE aa.status = 'active'
+      AND aa.project_id = ${project.projectId}
     ORDER BY p.name, aa.agent_type
   `) as unknown as AgentStatus[];
 
@@ -85,31 +117,32 @@ async function analyzeAgentReports(env: Env, agentId: number) {
     summaryLines.push(`Recent reports: ${data.reports.length}`);
   }
 
-  const summary = `Agent ecosystem analysis: ${activeAgents.length} active agents across ${Object.keys(projectMap).length} projects. ${reports.length} reports in last 7 days.\n\n${summaryLines.join("\n")}`;
+  const summary = `Agent ecosystem analysis for ${project.projectName}: ${activeAgents.length} active agents. ${reports.length} reports in last 7 days.\n\n${summaryLines.join("\n")}`;
 
   await updateTaskStatus(env.DATABASE_URL, agentId, 0, "completed", summary);
   await saveReport(env.DATABASE_URL, agentId, "Agent Ecosystem Analysis", summary, {
     active_agents: activeAgents.length,
-    projects_covered: Object.keys(projectMap).length,
+    projects_covered: 1,
     reports_analyzed: reports.length,
     stalled_tasks: Object.values(projectMap).reduce((sum, d) => sum + d.issues.length, 0),
   });
 
-  return { activeAgents: activeAgents.length, projects: Object.keys(projectMap).length, reports: reports.length };
+  return { project: project.projectName, activeAgents: activeAgents.length, projects: 1, reports: reports.length };
 }
 
 // Task 1: Generate cross-agent optimization recommendations
-async function generateOptimizations(env: Env, agentId: number) {
+async function generateOptimizations(env: Env, agentId: number, project: ProjectContext, preferredModel = "auto") {
   await updateTaskStatus(env.DATABASE_URL, agentId, 1, "in_progress");
 
   const sql = getDb(env.DATABASE_URL);
 
-  // Gather context: recent reports, active agents, project info
+  // Gather context for this project only.
   const reports = (await sql`
     SELECT ar.agent_type, ar.task_name, ar.summary, ar.metrics, p.name as project_name
     FROM agent_reports ar
     JOIN projects p ON ar.project_id = p.id
-    WHERE ar.created_at > NOW() - INTERVAL '14 days'
+    WHERE ar.project_id = ${project.projectId}
+      AND ar.created_at > NOW() - INTERVAL '14 days'
     ORDER BY ar.created_at DESC
     LIMIT 30
   `) as unknown as AgentReport[];
@@ -119,6 +152,7 @@ async function generateOptimizations(env: Env, agentId: number) {
     FROM agent_assignments aa
     JOIN projects p ON aa.project_id = p.id
     WHERE aa.status = 'active'
+      AND aa.project_id = ${project.projectId}
   `) as unknown as (AgentStatus & { description?: string })[];
 
   const context = agents.map((a) => {
@@ -132,7 +166,10 @@ async function generateOptimizations(env: Env, agentId: number) {
     `- [${r.project_name}/${r.agent_type}] ${r.task_name}: ${r.summary?.substring(0, 150)}`
   ).join("\n");
 
-  const prompt = `You are an AI marketing operations orchestrator. Analyze the following agent ecosystem and generate actionable optimization recommendations.
+  const prompt = `You are an AI marketing operations orchestrator. Analyze the following agent ecosystem for a single project and generate actionable optimization recommendations.
+
+PROJECT:
+- ${project.projectName}: ${project.projectWebsite || "N/A"}${project.projectDescription ? ` — ${project.projectDescription}` : ""}
 
 ACTIVE AGENTS:
 ${context}
@@ -142,15 +179,15 @@ ${reportContext}
 
 Based on this data, provide:
 1. **Cross-agent synergies**: Where should agents collaborate? (e.g., SEO findings → content creation → email distribution)
-2. **Workflow gaps**: What's missing? Which projects need more agent coverage?
-3. **Priority actions**: Top 5 specific actions to improve marketing ROI across all projects.
-4. **Content strategy**: Based on SEO and market trends, what content topics should be prioritized?
-5. **Resource allocation**: Which agents/projects need more attention vs. which are running well?
+2. **Workflow gaps**: What's missing? Which agent coverage is missing for this project?
+3. **Priority actions**: Top 5 specific actions to improve marketing ROI for this project.
+4. **Content strategy**: Based on SEO and market trends, what content topics should be prioritized for this project?
+5. **Resource allocation**: Which agents need more attention vs. which are running well?
 
-Format as a structured markdown report. Be specific with project names and agent types. Keep recommendations actionable.`;
+Format as a structured markdown report. Be specific with this project and its agent types only. Do not mention or analyze other projects. Keep recommendations actionable.`;
 
   try {
-    const analysis = await cerebrasCompletion(env, prompt, 2000);
+    const analysis = await cerebrasCompletion(env, prompt, 2000, preferredModel);
 
     await updateTaskStatus(env.DATABASE_URL, agentId, 1, "completed", analysis);
     await saveReport(env.DATABASE_URL, agentId, "Optimization Recommendations", analysis, {
@@ -167,27 +204,21 @@ Format as a structured markdown report. Be specific with project names and agent
 }
 
 // Task 2: Market intelligence — analyze trends and suggest content direction
-async function marketIntelligence(env: Env, agentId: number, config: Record<string, unknown>) {
+async function marketIntelligence(env: Env, agentId: number, project: ProjectContext, config: Record<string, unknown>) {
   await updateTaskStatus(env.DATABASE_URL, agentId, 2, "in_progress");
 
   const sql = getDb(env.DATABASE_URL);
 
-  // Get all projects for context
-  const projects = await sql`
-    SELECT name, website, description FROM projects ORDER BY name
-  `;
+  const projectContext = `- ${project.projectName}: ${project.projectWebsite || "no website"} — ${project.projectDescription || "no description"}`;
 
-  const projectContext = projects.map((p) =>
-    `- ${p.name}: ${p.website || "no website"} — ${p.description || "no description"}`
-  ).join("\n");
-
-  // Get latest SEO reports for keyword insights
+  // Get latest SEO reports for keyword insights for this project only.
   const seoReports = (await sql`
     SELECT ar.summary, ar.metrics, p.name as project_name
     FROM agent_reports ar
     JOIN projects p ON ar.project_id = p.id
     WHERE ar.agent_type = 'seo_content'
-    AND ar.created_at > NOW() - INTERVAL '30 days'
+      AND ar.project_id = ${project.projectId}
+      AND ar.created_at > NOW() - INTERVAL '30 days'
     ORDER BY ar.created_at DESC
     LIMIT 10
   `) as unknown as AgentReport[];
@@ -203,26 +234,26 @@ async function marketIntelligence(env: Env, agentId: number, config: Record<stri
 OUR PROJECTS:
 ${projectContext}
 
-LATEST SEO INSIGHTS:
+LATEST SEO INSIGHTS FOR THIS PROJECT:
 ${seoContext || "No recent SEO data available."}
 
 INDUSTRY FOCUS: ${industry}
 
 Please provide:
 1. **Market Trends**: Top 5 emerging trends in our industries that we should capitalize on
-2. **Content Opportunities**: 10 specific blog post / article titles we should create, mapped to specific projects
+2. **Content Opportunities**: 10 specific blog post / article titles we should create for this project
 3. **Competitive Insights**: What competitors are likely doing that we should respond to
 4. **Seasonal Factors**: Any upcoming events, seasons, or trends to prepare content for
 5. **Action Items**: Specific tasks to assign to SEO, email, and social media agents
 
-Be specific to our actual projects. Format as actionable markdown.`;
+Be specific to this project only. Do not mention or compare other projects. Format as actionable markdown.`;
 
   try {
-    const analysis = await cerebrasCompletion(env, prompt, 2000);
+    const analysis = await cerebrasCompletion(env, prompt, 2000, String(config.model || "auto"));
 
     await updateTaskStatus(env.DATABASE_URL, agentId, 2, "completed", analysis);
     await saveReport(env.DATABASE_URL, agentId, "Market Intelligence", analysis, {
-      projects_analyzed: projects.length,
+      projects_analyzed: 1,
       seo_reports_reviewed: seoReports.length,
     });
 
@@ -235,7 +266,7 @@ Be specific to our actual projects. Format as actionable markdown.`;
 }
 
 // Task 3: Auto-coordinate — trigger actions on other agents based on insights
-async function autoCoordinate(env: Env, agentId: number) {
+async function autoCoordinate(env: Env, agentId: number, project: ProjectContext) {
   await updateTaskStatus(env.DATABASE_URL, agentId, 3, "in_progress");
 
   const sql = getDb(env.DATABASE_URL);
@@ -246,6 +277,7 @@ async function autoCoordinate(env: Env, agentId: number) {
     FROM agent_assignments aa
     JOIN projects p ON aa.project_id = p.id
     WHERE aa.status = 'active'
+      AND aa.project_id = ${project.projectId}
   `) as unknown as AgentStatus[];
 
   const actions: string[] = [];
@@ -289,7 +321,9 @@ async function autoCoordinate(env: Env, agentId: number) {
   // Get orchestrator's own recommendations from the latest report
   const latestRecs = await sql`
     SELECT summary FROM agent_reports
-    WHERE agent_type = 'orchestrator' AND task_name = 'Optimization Recommendations'
+    WHERE project_id = ${project.projectId}
+      AND agent_type = 'orchestrator'
+      AND task_name = 'Optimization Recommendations'
     ORDER BY created_at DESC LIMIT 1
   `;
 
@@ -305,28 +339,28 @@ async function autoCoordinate(env: Env, agentId: number) {
 }
 
 // Task 4: Generate weekly operations digest
-async function weeklyDigest(env: Env, agentId: number) {
+async function weeklyDigest(env: Env, agentId: number, project: ProjectContext, preferredModel = "auto") {
   await updateTaskStatus(env.DATABASE_URL, agentId, 4, "in_progress");
 
   const sql = getDb(env.DATABASE_URL);
 
-  // Gather all data for the digest
+  // Gather weekly data for this project only.
   const weekReports = (await sql`
     SELECT ar.agent_type, ar.task_name, ar.summary, ar.metrics,
            ar.created_at, p.name as project_name
     FROM agent_reports ar
     JOIN projects p ON ar.project_id = p.id
-    WHERE ar.created_at > NOW() - INTERVAL '7 days'
+    WHERE ar.project_id = ${project.projectId}
+      AND ar.created_at > NOW() - INTERVAL '7 days'
     ORDER BY ar.created_at DESC
   `) as unknown as AgentReport[];
 
   const agentCounts = (await sql`
     SELECT aa.agent_type, COUNT(*)::int as count, aa.status
     FROM agent_assignments aa
+    WHERE aa.project_id = ${project.projectId}
     GROUP BY aa.agent_type, aa.status
   `) as unknown as { agent_type: string; count: number; status: string }[];
-
-  const projectCount = await sql`SELECT COUNT(*)::int as count FROM projects`;
 
   // Build digest with AI
   const reportSummaries = weekReports.slice(0, 20).map((r) =>
@@ -336,7 +370,7 @@ async function weeklyDigest(env: Env, agentId: number) {
   const prompt = `You are an AI operations manager. Generate a concise weekly digest email for the marketing team.
 
 STATS THIS WEEK:
-- Total projects: ${projectCount[0].count}
+- Project: ${project.projectName}
 - Reports generated: ${weekReports.length}
 - Agent distribution: ${agentCounts.map((a) => `${a.agent_type}(${a.count} ${a.status})`).join(", ")}
 
@@ -353,12 +387,12 @@ Generate a professional weekly digest that includes:
 Keep it concise and actionable. Format as markdown suitable for an email.`;
 
   try {
-    const digest = await cerebrasCompletion(env, prompt, 1500);
+    const digest = await cerebrasCompletion(env, prompt, 1500, preferredModel);
 
     await updateTaskStatus(env.DATABASE_URL, agentId, 4, "completed", digest);
     await saveReport(env.DATABASE_URL, agentId, "Weekly Operations Digest", digest, {
       reports_this_week: weekReports.length,
-      projects_active: projectCount[0].count as number,
+      projects_active: 1,
     });
 
     return { digest };
@@ -375,17 +409,19 @@ export async function handleOrchestrator(
   taskIndex: number,
   config: Record<string, unknown>
 ) {
+  const project = await getProjectContext(env, agentId);
+  const preferredModel = String(config.model || "auto");
   switch (taskIndex) {
     case 0:
-      return analyzeAgentReports(env, agentId);
+      return analyzeAgentReports(env, agentId, project);
     case 1:
-      return generateOptimizations(env, agentId);
+      return generateOptimizations(env, agentId, project, preferredModel);
     case 2:
-      return marketIntelligence(env, agentId, config);
+      return marketIntelligence(env, agentId, project, config);
     case 3:
-      return autoCoordinate(env, agentId);
+      return autoCoordinate(env, agentId, project);
     case 4:
-      return weeklyDigest(env, agentId);
+      return weeklyDigest(env, agentId, project, preferredModel);
     default:
       return { error: `Task ${taskIndex} not implemented for orchestrator` };
   }

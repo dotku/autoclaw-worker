@@ -7,6 +7,7 @@ import { handleContent } from "./handlers/content";
 import { handleOrchestrator } from "./handlers/orchestrator";
 import { handleDevAgent } from "./handlers/dev-agent";
 import { handleSocial } from "./handlers/social";
+import { decryptApiKey } from "./lib/crypto";
 
 export interface Env {
   DATABASE_URL: string;
@@ -18,6 +19,9 @@ export interface Env {
   AI_GATEWAY_API_KEY?: string;
   ANTHROPIC_API_KEY?: string;
   CEREBRAS_API_KEY?: string;
+  ALIBABA_API_KEY?: string;
+  ALIBABA_AI_BASE_URL?: string;
+  ENCRYPTION_KEY?: string;
   CONTENT_DATABASE_URL?: string;
   CONTENT_DEFAULT_BRAND_NAME?: string;
   CONTENT_DEFAULT_BRAND_DOMAIN?: string;
@@ -40,6 +44,21 @@ interface TaskRequest {
   user_id?: number;
 }
 
+type CronBody = {
+  start_after_id?: number;
+  max_agents?: number;
+};
+
+type CronResult = {
+  success: true;
+  agents_processed: number;
+  batch_size: number;
+  start_after_id: number;
+  has_more: boolean;
+  next_start_after: number | null;
+  results: { agent_id: number; type: string; task: string; status: string }[];
+};
+
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -50,6 +69,137 @@ function json(data: unknown, status = 200) {
       "Access-Control-Allow-Headers": "Content-Type, Authorization",
     },
   });
+}
+
+async function resolveRuntimeEnv(
+  env: Env,
+  sql: ReturnType<typeof getDb>,
+  userId: number,
+  config: Record<string, unknown>
+): Promise<Env> {
+  const runtimeEnv: Env = { ...env };
+  const preferredModel = String(config.model || "auto");
+  const needsAlibaba = preferredModel === "alibaba/qwen-plus" || preferredModel === "alibaba/qwen-turbo";
+
+  if (!needsAlibaba) {
+    return runtimeEnv;
+  }
+
+  // Qwen models are strict BYOK. Do not fall back to a system-level Alibaba key.
+  delete runtimeEnv.ALIBABA_API_KEY;
+
+  if (!runtimeEnv.ENCRYPTION_KEY) {
+    return runtimeEnv;
+  }
+
+  const rows = await sql`
+    SELECT api_key
+    FROM user_api_keys
+    WHERE user_id = ${userId} AND service = 'alibaba'
+    LIMIT 1
+  `;
+
+  if (rows.length === 0) {
+    return runtimeEnv;
+  }
+
+  try {
+    runtimeEnv.ALIBABA_API_KEY = await decryptApiKey(String(rows[0].api_key), runtimeEnv.ENCRYPTION_KEY);
+  } catch {
+    // Keep runtime env without Alibaba credentials if BYOK decryption fails.
+  }
+
+  return runtimeEnv;
+}
+
+async function runCronBatch(env: Env, body: CronBody = {}): Promise<CronResult> {
+  const sql = getDb(env.DATABASE_URL);
+  const startAfterId = Number(body.start_after_id || 0);
+  // Keep batch size conservative to avoid Cloudflare Worker subrequest limits.
+  const maxAgents = Math.max(1, Math.min(10, Number(body.max_agents || 1)));
+
+  const agents = await sql`
+    SELECT aa.id, aa.agent_type, aa.config, aa.project_id, p.user_id
+    FROM agent_assignments aa
+    JOIN projects p ON aa.project_id = p.id
+    WHERE aa.status = 'active'
+      AND aa.id > ${startAfterId}
+    ORDER BY aa.id
+    LIMIT ${maxAgents + 1}
+  `;
+
+  const results: { agent_id: number; type: string; task: string; status: string }[] = [];
+  const hasMore = agents.length > maxAgents;
+  const pageAgents = hasMore ? agents.slice(0, maxAgents) : agents;
+  const nextStartAfter =
+    pageAgents.length > 0 ? (pageAgents[pageAgents.length - 1].id as number) : startAfterId;
+
+  for (const agent of pageAgents) {
+    const config = (agent.config as Record<string, unknown>) || {};
+    const tasks = (config.tasks as { name: string; status: string }[]) || [];
+
+    const nextIdx = tasks.findIndex((t) => t.status === "in_progress" || t.status === "pending");
+
+    if (nextIdx === -1) {
+      results.push({
+        agent_id: agent.id as number,
+        type: agent.agent_type as string,
+        task: "all tasks completed",
+        status: "skipped",
+      });
+      continue;
+    }
+
+    const agentId = agent.id as number;
+    const agentType = agent.agent_type as string;
+    const projectId = agent.project_id as number;
+    const userId = agent.user_id as number;
+    const runtimeEnv = await resolveRuntimeEnv(env, sql, userId, config);
+
+    try {
+      switch (agentType) {
+        case "seo_content":
+          await handleSEO(runtimeEnv, agentId, nextIdx, config);
+          break;
+        case "lead_prospecting":
+          await handleLeads(runtimeEnv, agentId, nextIdx, config, projectId, userId);
+          break;
+        case "email_marketing":
+          await handleEmail(runtimeEnv, agentId, nextIdx, config, projectId);
+          break;
+        case "product_manager":
+          await handleMonitor(runtimeEnv, agentId, nextIdx, config);
+          break;
+        case "content_gen":
+          await handleContent(runtimeEnv, agentId, nextIdx, config);
+          break;
+        case "orchestrator":
+          await handleOrchestrator(runtimeEnv, agentId, nextIdx, config);
+          break;
+        case "dev_agent":
+          await handleDevAgent(runtimeEnv, agentId, nextIdx, config);
+          break;
+        case "social_media":
+          await handleSocial(runtimeEnv, agentId, nextIdx, config);
+          break;
+        default:
+          throw new Error(`${agentType} is not supported yet`);
+      }
+      results.push({ agent_id: agentId, type: agentType, task: tasks[nextIdx].name, status: "completed" });
+    } catch (e) {
+      results.push({ agent_id: agentId, type: agentType, task: tasks[nextIdx].name, status: `error: ${e}` });
+    }
+  }
+
+  return {
+    success: true,
+    agents_processed: results.length,
+    batch_size: maxAgents,
+    start_after_id: startAfterId,
+    has_more: hasMore,
+    next_start_after: hasMore ? nextStartAfter : null,
+    results,
+  };
 }
 
 export default {
@@ -99,33 +249,34 @@ export default {
         const config = (agent.config as Record<string, unknown>) || {};
         const agentProjectId = project_id || (agent.project_id as number);
         const agentUserId = user_id || (agent.user_id as number);
+        const runtimeEnv = await resolveRuntimeEnv(env, sql, agentUserId, config);
 
         let result: unknown;
 
         switch (agent.agent_type) {
           case "seo_content":
-            result = await handleSEO(env, agent_id, task_index, config);
+            result = await handleSEO(runtimeEnv, agent_id, task_index, config);
             break;
           case "lead_prospecting":
-            result = await handleLeads(env, agent_id, task_index, config, agentProjectId, agentUserId);
+            result = await handleLeads(runtimeEnv, agent_id, task_index, config, agentProjectId, agentUserId);
             break;
           case "email_marketing":
-            result = await handleEmail(env, agent_id, task_index, config, agentProjectId);
+            result = await handleEmail(runtimeEnv, agent_id, task_index, config, agentProjectId);
             break;
           case "product_manager":
-            result = await handleMonitor(env, agent_id, task_index, config);
+            result = await handleMonitor(runtimeEnv, agent_id, task_index, config);
             break;
           case "content_gen":
-            result = await handleContent(env, agent_id, task_index, config);
+            result = await handleContent(runtimeEnv, agent_id, task_index, config);
             break;
           case "orchestrator":
-            result = await handleOrchestrator(env, agent_id, task_index, config);
+            result = await handleOrchestrator(runtimeEnv, agent_id, task_index, config);
             break;
           case "dev_agent":
-            result = await handleDevAgent(env, agent_id, task_index, config);
+            result = await handleDevAgent(runtimeEnv, agent_id, task_index, config);
             break;
           case "social_media":
-            result = await handleSocial(env, agent_id, task_index, config);
+            result = await handleSocial(runtimeEnv, agent_id, task_index, config);
             break;
           default:
             result = { error: `Agent type "${agent.agent_type}" not yet supported` };
@@ -156,32 +307,73 @@ export default {
         }
 
         const agent = agents[0];
-        const config = (agent.config as Record<string, unknown>) || {};
-        const tasks = (config.tasks as { name: string; status: string }[]) || [];
+        const results: { task_index: number; task_name: string; ok: boolean; data?: unknown; error?: string }[] = [];
 
-        // Find first in_progress or pending task
-        const nextTaskIndex = tasks.findIndex(
-          (t) => t.status === "in_progress" || t.status === "pending"
-        );
+        for (let i = 0; i < 25; i += 1) {
+          const refreshed = await sql`
+            SELECT aa.config, aa.project_id, p.user_id
+            FROM agent_assignments aa
+            JOIN projects p ON aa.project_id = p.id
+            WHERE aa.id = ${agent_id}
+          `;
 
-        if (nextTaskIndex === -1) {
-          return json({ message: "All tasks completed" });
+          if (refreshed.length === 0) {
+            return json({ error: "Agent not found" }, 404);
+          }
+
+          const config = (refreshed[0].config as Record<string, unknown>) || {};
+          const tasks = (config.tasks as { name: string; status: string }[]) || [];
+          const nextTaskIndex = tasks.findIndex((t) => t.status === "in_progress" || t.status === "pending");
+
+          if (nextTaskIndex === -1) {
+            return json({
+              message: results.length > 0 ? "All remaining tasks completed" : "All tasks completed",
+              tasks_run: results.length,
+              results,
+            });
+          }
+
+          const taskRequest = new Request(new URL("/execute", request.url), {
+            method: "POST",
+            headers: request.headers,
+            body: JSON.stringify({
+              agent_id,
+              task_index: nextTaskIndex,
+              project_id: refreshed[0].project_id,
+              user_id: refreshed[0].user_id,
+            }),
+          });
+
+          const executionResponse = await this.fetch(taskRequest, env);
+          const executionData = (await executionResponse.json()) as { error?: string; result?: unknown; message?: string };
+
+          if (!executionResponse.ok) {
+            results.push({
+              task_index: nextTaskIndex,
+              task_name: tasks[nextTaskIndex]?.name || `Task ${nextTaskIndex}`,
+              ok: false,
+              error: typeof executionData?.error === "string" ? executionData.error : "Task failed",
+            });
+            return json({
+              error: "Run-all stopped on task failure",
+              tasks_run: results.length,
+              results,
+            }, executionResponse.status);
+          }
+
+          results.push({
+            task_index: nextTaskIndex,
+            task_name: tasks[nextTaskIndex]?.name || `Task ${nextTaskIndex}`,
+            ok: true,
+            data: executionData,
+          });
         }
 
-        // Execute the task
-        const taskRequest = new Request(new URL("/execute", request.url), {
-          method: "POST",
-          headers: request.headers,
-          body: JSON.stringify({
-            agent_id,
-            task_index: nextTaskIndex,
-            project_id: agent.project_id,
-            user_id: agent.user_id,
-          }),
-        });
-
-        const result = await this.fetch(taskRequest, env);
-        return result;
+        return json({
+          error: "Run-all safety limit reached",
+          tasks_run: results.length,
+          results,
+        }, 409);
       } catch (e) {
         return json({ error: `Run-all error: ${e}` }, 500);
       }
@@ -193,107 +385,22 @@ export default {
     // Called by existing cron worker or manually
     if (request.method === "POST" && url.pathname === "/cron") {
       try {
-        const sql = getDb(env.DATABASE_URL);
-        type CronBody = { start_after_id?: number; max_agents?: number };
         let body: CronBody = {};
         try {
           body = (await request.json()) as CronBody;
         } catch {
           body = {};
         }
-        const startAfterId = Number(body.start_after_id || 0);
-        // Keep batch size conservative to avoid Cloudflare Worker subrequest limits.
-        const maxAgents = Math.max(1, Math.min(10, Number(body.max_agents || 1)));
-
-        const agents = await sql`
-          SELECT aa.id, aa.agent_type, aa.config, aa.project_id, p.user_id
-          FROM agent_assignments aa
-          JOIN projects p ON aa.project_id = p.id
-          WHERE aa.status = 'active'
-            AND aa.id > ${startAfterId}
-          ORDER BY aa.id
-          LIMIT ${maxAgents + 1}
-        `;
-
-        const results: { agent_id: number; type: string; task: string; status: string }[] = [];
-        const hasMore = agents.length > maxAgents;
-        const pageAgents = hasMore ? agents.slice(0, maxAgents) : agents;
-        const nextStartAfter = pageAgents.length > 0 ? (pageAgents[pageAgents.length - 1].id as number) : startAfterId;
-
-        for (const agent of pageAgents) {
-          const config = (agent.config as Record<string, unknown>) || {};
-          const tasks = (config.tasks as { name: string; status: string }[]) || [];
-
-          const nextIdx = tasks.findIndex(
-            (t) => t.status === "in_progress" || t.status === "pending"
-          );
-
-          if (nextIdx === -1) {
-            results.push({
-              agent_id: agent.id as number,
-              type: agent.agent_type as string,
-              task: "all tasks completed",
-              status: "skipped",
-            });
-            continue;
-          }
-
-          // Execute task directly
-          const agentId = agent.id as number;
-          const agentType = agent.agent_type as string;
-          const projectId = agent.project_id as number;
-          const userId = agent.user_id as number;
-          let taskResult: unknown;
-
-          try {
-            switch (agentType) {
-              case "seo_content":
-                taskResult = await handleSEO(env, agentId, nextIdx, config);
-                break;
-              case "lead_prospecting":
-                taskResult = await handleLeads(env, agentId, nextIdx, config, projectId, userId);
-                break;
-              case "email_marketing":
-                taskResult = await handleEmail(env, agentId, nextIdx, config, projectId);
-                break;
-              case "product_manager":
-                taskResult = await handleMonitor(env, agentId, nextIdx, config);
-                break;
-              case "content_gen":
-                taskResult = await handleContent(env, agentId, nextIdx, config);
-                break;
-              case "orchestrator":
-                taskResult = await handleOrchestrator(env, agentId, nextIdx, config);
-                break;
-              case "dev_agent":
-                taskResult = await handleDevAgent(env, agentId, nextIdx, config);
-                break;
-              case "social_media":
-                taskResult = await handleSocial(env, agentId, nextIdx, config);
-                break;
-              default:
-                taskResult = { error: `${agentType} is not supported yet` };
-            }
-            results.push({ agent_id: agentId, type: agentType, task: tasks[nextIdx].name, status: "completed" });
-          } catch (e) {
-            results.push({ agent_id: agentId, type: agentType, task: tasks[nextIdx].name, status: `error: ${e}` });
-          }
-        }
-
-        return json({
-          success: true,
-          agents_processed: results.length,
-          batch_size: maxAgents,
-          start_after_id: startAfterId,
-          has_more: hasMore,
-          next_start_after: hasMore ? nextStartAfter : null,
-          results,
-        });
+        return json(await runCronBatch(env, body));
       } catch (e) {
         return json({ error: `Cron error: ${e}` }, 500);
       }
     }
 
     return json({ error: "Not found" }, 404);
+  },
+
+  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(runCronBatch(env, { max_agents: 1 }));
   },
 };

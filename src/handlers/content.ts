@@ -215,7 +215,7 @@ async function generateArticle(env: Env, agentId: number, config: ContentConfig)
 正文内容（含hashtag）`;
 
   try {
-    const content = await claudeCompletion(env, prompt, 2000);
+    const content = await claudeCompletion(env, prompt, 2000, String(config.model || "auto"));
 
     // Parse title and body
     const lines = content.trim().split("\n");

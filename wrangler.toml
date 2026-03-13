@@ -16,6 +16,4 @@ compatibility_date = "2024-12-30"
 [vars]
 ENVIRONMENT = "development"
 
-# This template does not set a native Cloudflare cron trigger by default.
-# You can call POST /cron from an external scheduler (Vercel cron, GitHub Actions, etc.)
-# or add [triggers] in this file if you want Cloudflare native scheduling.
+# Scheduling is handled externally (for example GitHub Actions or Vercel cron).

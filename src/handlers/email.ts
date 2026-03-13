@@ -10,7 +10,7 @@ interface Env {
 }
 
 // Task 0: Research target audience & ICP
-async function researchICP(env: Env, agentId: number, projectDesc: string) {
+async function researchICP(env: Env, agentId: number, projectDesc: string, preferredModel = "auto") {
   await updateTaskStatus(env.DATABASE_URL, agentId, 0, "in_progress");
 
   const prompt = `You are a B2B marketing expert. Based on this business description, define an Ideal Customer Profile (ICP):
@@ -26,7 +26,7 @@ Provide:
 Format as structured text with clear headings.`;
 
   try {
-    const icpContent = await cerebrasCompletion(env, prompt, 1000);
+    const icpContent = await cerebrasCompletion(env, prompt, 1000, preferredModel);
 
     await updateTaskStatus(env.DATABASE_URL, agentId, 0, "completed", icpContent);
     await saveReport(env.DATABASE_URL, agentId, "ICP Research", `Completed ICP research for project`, {
@@ -42,7 +42,7 @@ Format as structured text with clear headings.`;
 }
 
 // Task 2: Create email templates
-async function createTemplates(env: Env, agentId: number, projectDesc: string, website: string) {
+async function createTemplates(env: Env, agentId: number, projectDesc: string, website: string, preferredModel = "auto") {
   await updateTaskStatus(env.DATABASE_URL, agentId, 2, "in_progress");
 
   const prompt = `You are an expert cold email copywriter. Create 3 email templates for this business:
@@ -61,7 +61,7 @@ For each template provide:
 Keep each email under 150 words. Be professional but personable.`;
 
   try {
-    const templates = await claudeCompletion(env, prompt, 2000);
+    const templates = await claudeCompletion(env, prompt, 2000, preferredModel);
 
     await updateTaskStatus(env.DATABASE_URL, agentId, 2, "completed", templates);
     await saveReport(env.DATABASE_URL, agentId, "Email Templates", "Created 3 email templates", {
@@ -129,14 +129,15 @@ export async function handleEmail(
 ) {
   const description = (config.plan as string) || "";
   const website = (config.website as string) || "";
+  const preferredModel = String(config.model || "auto");
 
   switch (taskIndex) {
     case 0:
-      return researchICP(env, agentId, description);
+      return researchICP(env, agentId, description, preferredModel);
     case 1:
       return buildEmailList(env, agentId, projectId);
     case 2:
-      return createTemplates(env, agentId, description, website);
+      return createTemplates(env, agentId, description, website, preferredModel);
     default:
       return { error: `Task ${taskIndex} not yet implemented for email marketing` };
   }

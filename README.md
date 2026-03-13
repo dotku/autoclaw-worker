@@ -38,6 +38,9 @@ All `POST` endpoints require:
 - `AI_GATEWAY_API_KEY`
 - `ANTHROPIC_API_KEY`
 - `CEREBRAS_API_KEY`
+- `ALIBABA_API_KEY`
+- `ALIBABA_AI_BASE_URL`
+- `ENCRYPTION_KEY`: required if you want worker tasks to decrypt user BYOK keys such as Alibaba from `user_api_keys`
 - `GITHUB_TOKEN`
 
 Use `.dev.vars.example` as a local template.

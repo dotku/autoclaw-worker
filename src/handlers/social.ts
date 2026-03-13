@@ -45,7 +45,7 @@ Provide a structured audit report covering:
 Format the report in clear sections with actionable insights.`;
 
   try {
-    const report = await claudeCompletion(env, prompt, 3000);
+    const report = await claudeCompletion(env, prompt, 3000, String(config.model || "auto"));
 
     const summary = `Social presence audit completed for ${projectName}`;
     await updateTaskStatus(env.DATABASE_URL, agentId, 0, "completed", summary);
@@ -108,7 +108,7 @@ Generate a complete brand guide covering:
 Format as a professional brand guide document.`;
 
   try {
-    const guidelines = await claudeCompletion(env, prompt, 4000);
+    const guidelines = await claudeCompletion(env, prompt, 4000, String(config.model || "auto"));
 
     const summary = `Brand voice & content guidelines created for ${projectName}`;
     await updateTaskStatus(env.DATABASE_URL, agentId, 1, "completed", summary);
@@ -168,7 +168,7 @@ Generate a complete content queue with:
 Format as a day-by-day calendar with clear sections.`;
 
   try {
-    const contentQueue = await claudeCompletion(env, prompt, 6000);
+    const contentQueue = await claudeCompletion(env, prompt, 6000, String(config.model || "auto"));
 
     const summary = `2-week content queue built for ${projectName} starting ${today}`;
     await updateTaskStatus(env.DATABASE_URL, agentId, 2, "completed", summary);
@@ -225,7 +225,7 @@ Provide a detailed guide covering:
 Format as an actionable implementation guide.`;
 
   try {
-    const guide = await claudeCompletion(env, prompt, 3000);
+    const guide = await claudeCompletion(env, prompt, 3000, String(config.model || "auto"));
 
     const summary = `Scheduling tool integration guide created for ${projectName}`;
     await updateTaskStatus(env.DATABASE_URL, agentId, 3, "completed", summary);
@@ -290,7 +290,7 @@ Design a comprehensive engagement campaign covering:
 Format as a ready-to-execute campaign plan.`;
 
   try {
-    const campaign = await claudeCompletion(env, prompt, 4000);
+    const campaign = await claudeCompletion(env, prompt, 4000, String(config.model || "auto"));
 
     const summary = `Engagement campaign plan created for ${projectName}`;
     await updateTaskStatus(env.DATABASE_URL, agentId, 4, "completed", summary);
@@ -354,7 +354,7 @@ Build a complete analytics and reporting system covering:
 Format as a practical analytics playbook with templates.`;
 
   try {
-    const framework = await claudeCompletion(env, prompt, 4000);
+    const framework = await claudeCompletion(env, prompt, 4000, String(config.model || "auto"));
 
     const summary = `Metrics tracking framework created for ${projectName}`;
     await updateTaskStatus(env.DATABASE_URL, agentId, 5, "completed", summary);

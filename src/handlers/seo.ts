@@ -69,7 +69,7 @@ async function auditSEO(env: Env, agentId: number, website: string) {
 }
 
 // Task 1: Keyword research using AI
-async function keywordResearch(env: Env, agentId: number, website: string, description: string) {
+async function keywordResearch(env: Env, agentId: number, website: string, description: string, preferredModel = "auto") {
   await updateTaskStatus(env.DATABASE_URL, agentId, 1, "in_progress");
 
   const prompt = `You are an SEO expert. Given this website: ${website}
@@ -85,7 +85,7 @@ Format as a JSON array of objects with keys: keyword, volume, competition, inten
 Return ONLY the JSON array, no other text.`;
 
   try {
-    const content = await cerebrasCompletion(env, prompt, 1500);
+    const content = await cerebrasCompletion(env, prompt, 1500, preferredModel);
 
     // Extract JSON from response
     const jsonMatch = content.match(/\[[\s\S]*\]/);
@@ -110,6 +110,7 @@ Return ONLY the JSON array, no other text.`;
 export async function handleSEO(env: Env, agentId: number, taskIndex: number, config: Record<string, unknown>) {
   const website = (config.website as string) || "";
   const description = (config.plan as string) || "";
+  const preferredModel = String(config.model || "auto");
 
   if (!website) {
     return { error: "No website URL configured for this agent" };
@@ -119,7 +120,7 @@ export async function handleSEO(env: Env, agentId: number, taskIndex: number, co
     case 0:
       return auditSEO(env, agentId, website);
     case 1:
-      return keywordResearch(env, agentId, website, description);
+      return keywordResearch(env, agentId, website, description, preferredModel);
     default:
       return { error: `Task ${taskIndex} not yet implemented` };
   }

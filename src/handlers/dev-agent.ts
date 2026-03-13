@@ -132,7 +132,7 @@ Then provide a **Priority Feature Matrix** ranked by:
 Format as structured markdown. Be specific and actionable.`;
 
   try {
-    const analysis = await cerebrasCompletion(env, prompt, 4000);
+    const analysis = await cerebrasCompletion(env, prompt, 4000, String(config.model || "auto"));
 
     await updateTaskStatus(env.DATABASE_URL, agentId, 0, "completed", analysis);
     await saveReport(env.DATABASE_URL, agentId, "Competitor Research", analysis, {
@@ -199,7 +199,7 @@ Based on the competitor analysis, create a detailed feature gap analysis with im
 Produce a structured sprint plan with 2-week sprints. Format as markdown with clear sections.`;
 
   try {
-    const analysis = await cerebrasCompletion(env, prompt, 4000);
+    const analysis = await cerebrasCompletion(env, prompt, 4000, String(config.model || "auto"));
 
     await updateTaskStatus(env.DATABASE_URL, agentId, 1, "completed", analysis);
     await saveReport(env.DATABASE_URL, agentId, "Feature Gap Analysis", analysis, {
@@ -268,7 +268,7 @@ Category labels: user-system, payment, workflow, data, notifications
 Always include "auto-generated" label.`;
 
   try {
-    const issuesJson = await cerebrasCompletion(env, prompt, 3000);
+    const issuesJson = await cerebrasCompletion(env, prompt, 3000, String(config.model || "auto"));
 
     // Parse the JSON response
     const jsonMatch = issuesJson.match(/\[[\s\S]*\]/);
@@ -420,7 +420,7 @@ Provide a detailed implementation plan in markdown format:
 
 Be specific with file paths and code. Use TypeScript, Auth0 for auth, Prisma for DB, Tailwind for styling.`;
 
-    const planResponse = await cerebrasCompletion(env, prompt, 4000);
+    const planResponse = await cerebrasCompletion(env, prompt, 4000, String(config.model || "auto"));
 
     // Post the implementation plan as a comment on the issue
     await fetch(`https://api.github.com/repos/${repo}/issues/${issue.number}/comments`, {
@@ -530,7 +530,7 @@ Generate a concise sprint report for ${product.productName} with:
 Format as markdown. Keep it actionable and concise.`;
 
   try {
-    const report = await cerebrasCompletion(env, prompt, 1500);
+    const report = await cerebrasCompletion(env, prompt, 1500, String(config.model || "auto"));
 
     await updateTaskStatus(env.DATABASE_URL, agentId, 4, "completed", report);
     await saveReport(env.DATABASE_URL, agentId, "Sprint Progress Report", report, {
