@@ -1,6 +1,7 @@
 import { neon } from "@neondatabase/serverless";
-import { updateTaskStatus, saveReport } from "../lib/db";
-import { claudeCompletion } from "../lib/ai";
+import { updateTaskStatus, saveReport, withModelMetrics, failTask } from "../lib/db";
+import { claudeCompletionWithMeta } from "../lib/ai";
+import { localeInstruction } from "../lib/locale";
 
 interface Env {
   DATABASE_URL: string;
@@ -193,6 +194,8 @@ async function generateArticle(env: Env, agentId: number, config: ContentConfig)
   const cover = pickCover(theme, weekNumber);
 
   const { brandName, brandDomain, contactPhone, audience, marketRegion } = getContentProfile(env, config);
+  const userLocale = (config.locale as string) || "en";
+  const langHint = localeInstruction(userLocale);
 
   const prompt = `你是 ${brandName} 的内容运营，服务 ${marketRegion} 的 ${audience}。
 
@@ -212,10 +215,12 @@ async function generateArticle(env: Env, agentId: number, config: ContentConfig)
 请直接输出，格式：
 第一行：标题
 空一行
-正文内容（含hashtag）`;
+正文内容（含hashtag）
+${langHint}`;
 
   try {
-    const content = await claudeCompletion(env, prompt, 2000, String(config.model || "auto"));
+    const preferredModel = String(config.model || "auto");
+    const { content, model } = await claudeCompletionWithMeta(env, prompt, 2000, preferredModel);
 
     // Parse title and body
     const lines = content.trim().split("\n");
@@ -238,18 +243,18 @@ async function generateArticle(env: Env, agentId: number, config: ContentConfig)
     const summary = `Generated article: "${title}" (ID: ${articleId}, theme: ${theme})`;
 
     await updateTaskStatus(env.DATABASE_URL, agentId, 0, "completed", summary);
-    await saveReport(env.DATABASE_URL, agentId, "Content Generation", summary, {
+    await saveReport(env.DATABASE_URL, agentId, "Content Generation", summary, withModelMetrics({
       article_id: articleId,
       theme,
       angle,
       title,
       word_count: body.length,
-    });
+    }, preferredModel, model));
 
     return { articleId, title, theme, angle };
   } catch (e) {
     const msg = `Content generation failed: ${e}`;
-    await updateTaskStatus(env.DATABASE_URL, agentId, 0, "completed", msg);
+    await failTask(env.DATABASE_URL, agentId, 0, "Content Generation", msg, "auto");
     return { error: msg };
   }
 }

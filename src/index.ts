@@ -1,4 +1,4 @@
-import { getDb } from "./lib/db";
+import { getDb, updateTaskStatus } from "./lib/db";
 import { handleSEO } from "./handlers/seo";
 import { handleLeads } from "./handlers/leads";
 import { handleEmail } from "./handlers/email";
@@ -7,6 +7,7 @@ import { handleContent } from "./handlers/content";
 import { handleOrchestrator } from "./handlers/orchestrator";
 import { handleDevAgent } from "./handlers/dev-agent";
 import { handleSocial } from "./handlers/social";
+import { handleSales } from "./handlers/sales";
 import { decryptApiKey } from "./lib/crypto";
 
 export interface Env {
@@ -15,7 +16,10 @@ export interface Env {
   HUNTER_API_KEY?: string;
   SNOV_API_ID?: string;
   SNOV_API_SECRET?: string;
+  APOLLO_API_KEY?: string;
+  APIFY_API_TOKEN?: string;
   BREVO_API_KEY?: string;
+  SENDGRID_API_KEY?: string;
   AI_GATEWAY_API_KEY?: string;
   ANTHROPIC_API_KEY?: string;
   CEREBRAS_API_KEY?: string;
@@ -34,6 +38,8 @@ export interface Env {
   DEV_AGENT_DEFAULT_WEBSITE?: string;
   DEV_AGENT_DEFAULT_TECH_STACK?: string;
   GITHUB_TOKEN?: string;
+  // Self service binding — used by /run-all to chain tasks across invocations
+  SELF?: Fetcher;
 }
 
 interface TaskRequest {
@@ -42,7 +48,11 @@ interface TaskRequest {
   // These are passed from the Vercel API for context
   project_id?: number;
   user_id?: number;
+  locale?: string;
 }
+
+// Re-export for any direct consumers
+export { localeInstruction } from "./lib/locale";
 
 type CronBody = {
   start_after_id?: number;
@@ -81,6 +91,64 @@ async function resolveRuntimeEnv(
   const preferredModel = String(config.model || "auto");
   const needsAlibaba = preferredModel === "alibaba/qwen-plus" || preferredModel === "alibaba/qwen-turbo";
 
+  if (!runtimeEnv.ENCRYPTION_KEY) {
+    return runtimeEnv;
+  }
+
+  // Load BYOK keys (email providers + lead enrichment + AI models)
+  // 1. User's own keys first
+  const byokKeys = await sql`
+    SELECT service, api_key
+    FROM user_api_keys
+    WHERE user_id = ${userId} AND service IN ('sendgrid', 'brevo', 'apollo', 'apify', 'hunter', 'snov_api_id', 'snov_api_secret', 'cerebras', 'anthropic', 'openai', 'google', 'vercel')
+  `;
+  for (const row of byokKeys) {
+    try {
+      const decrypted = await decryptApiKey(String(row.api_key), runtimeEnv.ENCRYPTION_KEY);
+      if (row.service === "sendgrid") runtimeEnv.SENDGRID_API_KEY = decrypted;
+      if (row.service === "brevo") runtimeEnv.BREVO_API_KEY = decrypted;
+      if (row.service === "apollo") runtimeEnv.APOLLO_API_KEY = decrypted;
+      if (row.service === "apify") runtimeEnv.APIFY_API_TOKEN = decrypted;
+      if (row.service === "hunter") runtimeEnv.HUNTER_API_KEY = decrypted;
+      if (row.service === "snov_api_id") runtimeEnv.SNOV_API_ID = decrypted;
+      if (row.service === "snov_api_secret") runtimeEnv.SNOV_API_SECRET = decrypted;
+      // AI model keys
+      if (row.service === "cerebras" && !runtimeEnv.CEREBRAS_API_KEY) runtimeEnv.CEREBRAS_API_KEY = decrypted;
+      if (row.service === "anthropic" && !runtimeEnv.ANTHROPIC_API_KEY) runtimeEnv.ANTHROPIC_API_KEY = decrypted;
+      if (row.service === "vercel" && !runtimeEnv.AI_GATEWAY_API_KEY) runtimeEnv.AI_GATEWAY_API_KEY = decrypted;
+    } catch {
+      // Skip if decryption fails
+    }
+  }
+
+  // 2. Fall back to org-level keys for any missing services
+  const orgKeys = await sql`
+    SELECT ok.service, ok.api_key
+    FROM org_api_keys ok
+    JOIN organization_members om ON ok.org_id = om.org_id
+    WHERE om.user_id = ${userId}
+      AND ok.service IN ('sendgrid', 'brevo', 'apollo', 'apify', 'hunter', 'snov_api_id', 'snov_api_secret', 'cerebras', 'anthropic', 'openai', 'google', 'vercel')
+  `;
+  for (const row of orgKeys) {
+    try {
+      const decrypted = await decryptApiKey(String(row.api_key), runtimeEnv.ENCRYPTION_KEY);
+      // Only set if not already resolved from user keys or env
+      if (row.service === "sendgrid" && !runtimeEnv.SENDGRID_API_KEY) runtimeEnv.SENDGRID_API_KEY = decrypted;
+      if (row.service === "brevo" && !runtimeEnv.BREVO_API_KEY) runtimeEnv.BREVO_API_KEY = decrypted;
+      if (row.service === "apollo" && !runtimeEnv.APOLLO_API_KEY) runtimeEnv.APOLLO_API_KEY = decrypted;
+      if (row.service === "apify" && !runtimeEnv.APIFY_API_TOKEN) runtimeEnv.APIFY_API_TOKEN = decrypted;
+      if (row.service === "hunter" && !runtimeEnv.HUNTER_API_KEY) runtimeEnv.HUNTER_API_KEY = decrypted;
+      if (row.service === "snov_api_id" && !runtimeEnv.SNOV_API_ID) runtimeEnv.SNOV_API_ID = decrypted;
+      if (row.service === "snov_api_secret" && !runtimeEnv.SNOV_API_SECRET) runtimeEnv.SNOV_API_SECRET = decrypted;
+      // AI model keys
+      if (row.service === "cerebras" && !runtimeEnv.CEREBRAS_API_KEY) runtimeEnv.CEREBRAS_API_KEY = decrypted;
+      if (row.service === "anthropic" && !runtimeEnv.ANTHROPIC_API_KEY) runtimeEnv.ANTHROPIC_API_KEY = decrypted;
+      if (row.service === "vercel" && !runtimeEnv.AI_GATEWAY_API_KEY) runtimeEnv.AI_GATEWAY_API_KEY = decrypted;
+    } catch {
+      // Skip if decryption fails
+    }
+  }
+
   if (!needsAlibaba) {
     return runtimeEnv;
   }
@@ -88,18 +156,20 @@ async function resolveRuntimeEnv(
   // Qwen models are strict BYOK. Do not fall back to a system-level Alibaba key.
   delete runtimeEnv.ALIBABA_API_KEY;
 
-  if (!runtimeEnv.ENCRYPTION_KEY) {
-    return runtimeEnv;
-  }
-
+  // Check user's own key first, then org key
   const rows = await sql`
-    SELECT api_key
-    FROM user_api_keys
-    WHERE user_id = ${userId} AND service = 'alibaba'
-    LIMIT 1
+    SELECT api_key FROM user_api_keys WHERE user_id = ${userId} AND service = 'alibaba' LIMIT 1
   `;
-
   if (rows.length === 0) {
+    const orgRows = await sql`
+      SELECT ok.api_key FROM org_api_keys ok
+      JOIN organization_members om ON ok.org_id = om.org_id
+      WHERE om.user_id = ${userId} AND ok.service = 'alibaba' LIMIT 1
+    `;
+    if (orgRows.length === 0) return runtimeEnv;
+    try {
+      runtimeEnv.ALIBABA_API_KEY = await decryptApiKey(String(orgRows[0].api_key), runtimeEnv.ENCRYPTION_KEY);
+    } catch { /* skip */ }
     return runtimeEnv;
   }
 
@@ -112,6 +182,31 @@ async function resolveRuntimeEnv(
   return runtimeEnv;
 }
 
+// Inject project metadata (website, description, name) into agent config at runtime
+async function enrichConfigWithProject(
+  sql: ReturnType<typeof getDb>,
+  config: Record<string, unknown>,
+  projectId: number,
+): Promise<Record<string, unknown>> {
+  try {
+    const rows = await sql`SELECT website, description, name FROM projects WHERE id = ${projectId}`;
+    if (rows.length > 0) {
+      if (rows[0].website && !config.website) config.website = rows[0].website;
+      if (rows[0].description && !config.project_description) config.project_description = rows[0].description;
+      if (rows[0].name && !config.project_name) config.project_name = rows[0].name;
+
+      // Auto-populate target_domains for lead prospecting from project website
+      if (!config.target_domains && rows[0].website) {
+        try {
+          const url = new URL(rows[0].website as string);
+          config.target_domains = [url.hostname.replace(/^www\./, "")];
+        } catch { /* invalid URL, skip */ }
+      }
+    }
+  } catch { /* non-critical */ }
+  return config;
+}
+
 async function runCronBatch(env: Env, body: CronBody = {}): Promise<CronResult> {
   const sql = getDb(env.DATABASE_URL);
   const startAfterId = Number(body.start_after_id || 0);
@@ -119,9 +214,10 @@ async function runCronBatch(env: Env, body: CronBody = {}): Promise<CronResult> 
   const maxAgents = Math.max(1, Math.min(10, Number(body.max_agents || 1)));
 
   const agents = await sql`
-    SELECT aa.id, aa.agent_type, aa.config, aa.project_id, p.user_id
+    SELECT aa.id, aa.agent_type, aa.config, aa.project_id, p.user_id, u.locale as user_locale
     FROM agent_assignments aa
     JOIN projects p ON aa.project_id = p.id
+    LEFT JOIN users u ON p.user_id = u.id
     WHERE aa.status = 'active'
       AND aa.id > ${startAfterId}
     ORDER BY aa.id
@@ -135,25 +231,27 @@ async function runCronBatch(env: Env, body: CronBody = {}): Promise<CronResult> 
     pageAgents.length > 0 ? (pageAgents[pageAgents.length - 1].id as number) : startAfterId;
 
   for (const agent of pageAgents) {
-    const config = (agent.config as Record<string, unknown>) || {};
+    const agentId = agent.id as number;
+    const agentType = agent.agent_type as string;
+    const projectId = agent.project_id as number;
+    const userId = agent.user_id as number;
+    const config = await enrichConfigWithProject(sql, (agent.config as Record<string, unknown>) || {}, projectId);
+    // Inject user locale for cron-triggered runs (frontend passes locale directly)
+    if (!config.locale && agent.user_locale) config.locale = agent.user_locale;
     const tasks = (config.tasks as { name: string; status: string }[]) || [];
 
     const nextIdx = tasks.findIndex((t) => t.status === "in_progress" || t.status === "pending");
 
     if (nextIdx === -1) {
       results.push({
-        agent_id: agent.id as number,
-        type: agent.agent_type as string,
+        agent_id: agentId,
+        type: agentType,
         task: "all tasks completed",
         status: "skipped",
       });
       continue;
     }
 
-    const agentId = agent.id as number;
-    const agentType = agent.agent_type as string;
-    const projectId = agent.project_id as number;
-    const userId = agent.user_id as number;
     const runtimeEnv = await resolveRuntimeEnv(env, sql, userId, config);
 
     try {
@@ -165,7 +263,7 @@ async function runCronBatch(env: Env, body: CronBody = {}): Promise<CronResult> 
           await handleLeads(runtimeEnv, agentId, nextIdx, config, projectId, userId);
           break;
         case "email_marketing":
-          await handleEmail(runtimeEnv, agentId, nextIdx, config, projectId);
+          await handleEmail(runtimeEnv, agentId, nextIdx, config, projectId, userId);
           break;
         case "product_manager":
           await handleMonitor(runtimeEnv, agentId, nextIdx, config);
@@ -181,6 +279,9 @@ async function runCronBatch(env: Env, body: CronBody = {}): Promise<CronResult> 
           break;
         case "social_media":
           await handleSocial(runtimeEnv, agentId, nextIdx, config);
+          break;
+        case "sales_followup":
+          await handleSales(runtimeEnv, agentId, nextIdx, config, projectId, userId);
           break;
         default:
           throw new Error(`${agentType} is not supported yet`);
@@ -226,7 +327,7 @@ export default {
     if (request.method === "POST" && url.pathname === "/execute") {
       try {
         const body = (await request.json()) as TaskRequest;
-        const { agent_id, task_index, project_id, user_id } = body;
+        const { agent_id, task_index, project_id, user_id, locale } = body;
 
         if (!agent_id || task_index === undefined) {
           return json({ error: "agent_id and task_index required" }, 400);
@@ -246,12 +347,14 @@ export default {
         }
 
         const agent = agents[0];
-        const config = (agent.config as Record<string, unknown>) || {};
+        const config = await enrichConfigWithProject(sql, (agent.config as Record<string, unknown>) || {}, project_id || (agent.project_id as number));
+        if (locale) config.locale = locale;
         const agentProjectId = project_id || (agent.project_id as number);
         const agentUserId = user_id || (agent.user_id as number);
         const runtimeEnv = await resolveRuntimeEnv(env, sql, agentUserId, config);
 
         let result: unknown;
+        const useMode = String(config.model || "auto");
 
         switch (agent.agent_type) {
           case "seo_content":
@@ -261,7 +364,7 @@ export default {
             result = await handleLeads(runtimeEnv, agent_id, task_index, config, agentProjectId, agentUserId);
             break;
           case "email_marketing":
-            result = await handleEmail(runtimeEnv, agent_id, task_index, config, agentProjectId);
+            result = await handleEmail(runtimeEnv, agent_id, task_index, config, agentProjectId, agentUserId);
             break;
           case "product_manager":
             result = await handleMonitor(runtimeEnv, agent_id, task_index, config);
@@ -278,8 +381,64 @@ export default {
           case "social_media":
             result = await handleSocial(runtimeEnv, agent_id, task_index, config);
             break;
+          case "sales_followup":
+            result = await handleSales(runtimeEnv, agent_id, task_index, config, agentProjectId, agentUserId);
+            break;
           default:
             result = { error: `Agent type "${agent.agent_type}" not yet supported` };
+        }
+
+        // If handler returned an error, ensure it's saved to the task status so Log shows it
+        if (result && typeof result === "object" && "error" in result) {
+          const errResult = result as { error: string };
+          try {
+            // Check if the task was already marked completed by the handler
+            const check = await sql`SELECT config FROM agent_assignments WHERE id = ${agent_id}`;
+            if (check.length > 0) {
+              const checkConfig = (check[0].config as { tasks?: { status: string; result?: string }[] }) || {};
+              const t = checkConfig.tasks?.[task_index];
+              if (t && t.status !== "completed") {
+                await updateTaskStatus(env.DATABASE_URL, agent_id, task_index, "completed", errResult.error);
+              } else if (t && !t.result) {
+                // Task marked completed but no result saved — save the error
+                await updateTaskStatus(env.DATABASE_URL, agent_id, task_index, "completed", errResult.error);
+              }
+            }
+          } catch { /* non-critical */ }
+        }
+
+        // Stamp model_used and use_mode onto the completed task config
+        try {
+          // Find the report just created by this task (within last 30s)
+          const latestReport = await sql`
+            SELECT metrics FROM agent_reports
+            WHERE agent_assignment_id = ${agent_id}
+              AND created_at > NOW() - INTERVAL '30 seconds'
+            ORDER BY created_at DESC LIMIT 1
+          `;
+          // Extract model_used: prefer report metrics, fall back to use_mode setting
+          let modelUsed = "none";
+          if (latestReport.length > 0) {
+            const metrics = latestReport[0].metrics as Record<string, unknown> | null;
+            if (metrics?.model_used) {
+              modelUsed = String(metrics.model_used);
+            } else if (useMode !== "auto") {
+              modelUsed = useMode;
+            }
+          }
+
+          const freshAgent = await sql`SELECT config FROM agent_assignments WHERE id = ${agent_id}`;
+          if (freshAgent.length > 0) {
+            const freshConfig = (freshAgent[0].config as { tasks?: { name: string; status: string; model_used?: string; use_mode?: string }[] }) || {};
+            const tasks = freshConfig.tasks || [];
+            if (task_index >= 0 && task_index < tasks.length) {
+              tasks[task_index].model_used = modelUsed;
+              tasks[task_index].use_mode = useMode;
+              await sql`UPDATE agent_assignments SET config = ${JSON.stringify({ ...freshConfig, tasks })} WHERE id = ${agent_id}`;
+            }
+          }
+        } catch {
+          // Non-critical — don't fail the task if model stamping fails
         }
 
         return json({ success: true, result });
@@ -288,11 +447,23 @@ export default {
       }
     }
 
-    // POST /run-all — run all pending tasks for an agent
+    // POST /run-all — run all pending tasks for an agent via chained self-invocations.
+    // Each invocation executes ONE task, then chains to itself via the SELF service
+    // binding so each task gets a fresh 50-subrequest budget.
+    // Accepts _chain_results / _depth internally for chaining; callers don't need them.
     if (request.method === "POST" && url.pathname === "/run-all") {
       try {
-        const body = (await request.json()) as { agent_id: number };
-        const { agent_id } = body;
+        const body = (await request.json()) as {
+          agent_id: number;
+          mode?: "continue" | "restart";
+          locale?: string;
+          _chain_results?: { task_index: number; task_name: string; ok: boolean; data?: unknown; error?: string }[];
+          _depth?: number;
+        };
+        const { agent_id, mode, locale: runLocale } = body;
+        const chainResults = body._chain_results || [];
+        const depth = body._depth || 0;
+        const MAX_CHAIN_DEPTH = 15; // CF service binding limit is 16
 
         const sql = getDb(env.DATABASE_URL);
         const agents = await sql`
@@ -306,74 +477,163 @@ export default {
           return json({ error: "Agent not found" }, 404);
         }
 
-        const agent = agents[0];
-        const results: { task_index: number; task_name: string; ok: boolean; data?: unknown; error?: string }[] = [];
-
-        for (let i = 0; i < 25; i += 1) {
-          const refreshed = await sql`
-            SELECT aa.config, aa.project_id, p.user_id
-            FROM agent_assignments aa
-            JOIN projects p ON aa.project_id = p.id
-            WHERE aa.id = ${agent_id}
-          `;
-
-          if (refreshed.length === 0) {
-            return json({ error: "Agent not found" }, 404);
+        // Restart mode: reset all tasks to pending, first to in_progress (only on first call)
+        if (mode === "restart" && depth === 0) {
+          const resetConfig = (agents[0].config as Record<string, unknown>) || {};
+          const resetTasks = (resetConfig.tasks as { name: string; status: string; result?: string; model_used?: string; use_mode?: string }[]) || [];
+          for (let j = 0; j < resetTasks.length; j++) {
+            resetTasks[j].status = j === 0 ? "in_progress" : "pending";
+            delete resetTasks[j].result;
+            delete resetTasks[j].model_used;
+            delete resetTasks[j].use_mode;
           }
+          await sql`UPDATE agent_assignments SET config = ${JSON.stringify({ ...resetConfig, tasks: resetTasks })} WHERE id = ${agent_id}`;
+        }
 
-          const config = (refreshed[0].config as Record<string, unknown>) || {};
-          const tasks = (config.tasks as { name: string; status: string }[]) || [];
-          const nextTaskIndex = tasks.findIndex((t) => t.status === "in_progress" || t.status === "pending");
+        const agentType = agents[0].agent_type as string;
+        const agentProjectId = agents[0].project_id as number;
+        const agentUserId = agents[0].user_id as number;
+        const config = await enrichConfigWithProject(sql, (agents[0].config as Record<string, unknown>) || {}, agentProjectId);
+        if (runLocale) config.locale = runLocale;
+        const tasks = (config.tasks as { name: string; status: string }[]) || [];
+        const nextTaskIndex = tasks.findIndex((t) => t.status === "in_progress" || t.status === "pending");
 
-          if (nextTaskIndex === -1) {
-            return json({
-              message: results.length > 0 ? "All remaining tasks completed" : "All tasks completed",
-              tasks_run: results.length,
-              results,
-            });
-          }
-
-          const taskRequest = new Request(new URL("/execute", request.url), {
-            method: "POST",
-            headers: request.headers,
-            body: JSON.stringify({
-              agent_id,
-              task_index: nextTaskIndex,
-              project_id: refreshed[0].project_id,
-              user_id: refreshed[0].user_id,
-            }),
-          });
-
-          const executionResponse = await this.fetch(taskRequest, env);
-          const executionData = (await executionResponse.json()) as { error?: string; result?: unknown; message?: string };
-
-          if (!executionResponse.ok) {
-            results.push({
-              task_index: nextTaskIndex,
-              task_name: tasks[nextTaskIndex]?.name || `Task ${nextTaskIndex}`,
-              ok: false,
-              error: typeof executionData?.error === "string" ? executionData.error : "Task failed",
-            });
-            return json({
-              error: "Run-all stopped on task failure",
-              tasks_run: results.length,
-              results,
-            }, executionResponse.status);
-          }
-
-          results.push({
-            task_index: nextTaskIndex,
-            task_name: tasks[nextTaskIndex]?.name || `Task ${nextTaskIndex}`,
-            ok: true,
-            data: executionData,
+        // No more tasks — return accumulated results
+        if (nextTaskIndex === -1) {
+          return json({
+            message: chainResults.length > 0 ? "All remaining tasks completed" : "All tasks completed",
+            tasks_run: chainResults.length,
+            results: chainResults,
           });
         }
 
+        const runtimeEnv = await resolveRuntimeEnv(env, sql, agentUserId, config);
+        const useMode = String(config.model || "auto");
+
+        // Execute ONE task in this invocation
+        try {
+          let result: unknown;
+          switch (agentType) {
+            case "seo_content":
+              result = await handleSEO(runtimeEnv, agent_id, nextTaskIndex, config);
+              break;
+            case "lead_prospecting":
+              result = await handleLeads(runtimeEnv, agent_id, nextTaskIndex, config, agentProjectId, agentUserId);
+              break;
+            case "email_marketing":
+              result = await handleEmail(runtimeEnv, agent_id, nextTaskIndex, config, agentProjectId, agentUserId);
+              break;
+            case "product_manager":
+              result = await handleMonitor(runtimeEnv, agent_id, nextTaskIndex, config);
+              break;
+            case "content_gen":
+              result = await handleContent(runtimeEnv, agent_id, nextTaskIndex, config);
+              break;
+            case "orchestrator":
+              result = await handleOrchestrator(runtimeEnv, agent_id, nextTaskIndex, config);
+              break;
+            case "dev_agent":
+              result = await handleDevAgent(runtimeEnv, agent_id, nextTaskIndex, config);
+              break;
+            case "social_media":
+              result = await handleSocial(runtimeEnv, agent_id, nextTaskIndex, config);
+              break;
+            case "sales_followup":
+              result = await handleSales(runtimeEnv, agent_id, nextTaskIndex, config, agentProjectId, agentUserId);
+              break;
+            default:
+              result = { error: `Agent type "${agentType}" not yet supported` };
+          }
+
+          // Stamp model_used onto task config
+          try {
+            const latestReport = await sql`
+              SELECT metrics FROM agent_reports
+              WHERE agent_assignment_id = ${agent_id}
+                AND created_at > NOW() - INTERVAL '30 seconds'
+              ORDER BY created_at DESC LIMIT 1
+            `;
+            let modelUsed = "none";
+            if (latestReport.length > 0) {
+              const metrics = latestReport[0].metrics as Record<string, unknown> | null;
+              if (metrics?.model_used) {
+                modelUsed = String(metrics.model_used);
+              } else if (useMode !== "auto") {
+                modelUsed = useMode;
+              }
+            }
+            const freshAgent = await sql`SELECT config FROM agent_assignments WHERE id = ${agent_id}`;
+            if (freshAgent.length > 0) {
+              const freshConfig = (freshAgent[0].config as { tasks?: { name: string; status: string; model_used?: string; use_mode?: string }[] }) || {};
+              const freshTasks = freshConfig.tasks || [];
+              if (nextTaskIndex >= 0 && nextTaskIndex < freshTasks.length) {
+                freshTasks[nextTaskIndex].model_used = modelUsed;
+                freshTasks[nextTaskIndex].use_mode = useMode;
+                await sql`UPDATE agent_assignments SET config = ${JSON.stringify({ ...freshConfig, tasks: freshTasks })} WHERE id = ${agent_id}`;
+              }
+            }
+          } catch {
+            // Non-critical
+          }
+
+          chainResults.push({
+            task_index: nextTaskIndex,
+            task_name: tasks[nextTaskIndex]?.name || `Task ${nextTaskIndex}`,
+            ok: true,
+            data: result,
+          });
+        } catch (e) {
+          chainResults.push({
+            task_index: nextTaskIndex,
+            task_name: tasks[nextTaskIndex]?.name || `Task ${nextTaskIndex}`,
+            ok: false,
+            error: `${e}`,
+          });
+          return json({
+            error: "Run-all stopped on task failure",
+            tasks_run: chainResults.length,
+            results: chainResults,
+          }, 500);
+        }
+
+        // Chain to self for the next task (new invocation = fresh subrequest budget)
+        if (env.SELF && depth < MAX_CHAIN_DEPTH) {
+          try {
+            const chainRes = await env.SELF.fetch(new Request("https://self/run-all", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${env.WORKER_AUTH_SECRET}`,
+              },
+              body: JSON.stringify({
+                agent_id,
+                mode: "continue",
+                locale: runLocale,
+                _chain_results: chainResults,
+                _depth: depth + 1,
+              }),
+            }));
+            // Return the chained response directly (it has the final aggregated results)
+            return new Response(chainRes.body, {
+              status: chainRes.status,
+              headers: chainRes.headers,
+            });
+          } catch (chainErr) {
+            // If chaining fails, return what we have so far
+            return json({
+              error: `Chain error at depth ${depth}: ${chainErr}`,
+              tasks_run: chainResults.length,
+              results: chainResults,
+            }, 500);
+          }
+        }
+
+        // No SELF binding or depth limit reached — return what we have
         return json({
-          error: "Run-all safety limit reached",
-          tasks_run: results.length,
-          results,
-        }, 409);
+          message: depth >= MAX_CHAIN_DEPTH ? "Chain depth limit reached" : "All tasks in this invocation completed",
+          tasks_run: chainResults.length,
+          results: chainResults,
+        });
       } catch (e) {
         return json({ error: `Run-all error: ${e}` }, 500);
       }

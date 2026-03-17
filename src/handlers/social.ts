@@ -1,5 +1,6 @@
-import { updateTaskStatus, saveReport } from "../lib/db";
-import { claudeCompletion } from "../lib/ai";
+import { updateTaskStatus, saveReport, withModelMetrics, failTask } from "../lib/db";
+import { claudeCompletionWithMeta } from "../lib/ai";
+import { localeInstruction } from "../lib/locale";
 
 interface Env {
   DATABASE_URL: string;
@@ -9,7 +10,7 @@ interface Env {
 }
 
 // Task 0: Audit existing social presence
-async function auditSocialPresence(env: Env, agentId: number, config: Record<string, unknown>) {
+async function auditSocialPresence(env: Env, agentId: number, config: Record<string, unknown>, langHint = "") {
   await updateTaskStatus(env.DATABASE_URL, agentId, 0, "in_progress");
 
   const projectName = (config.project_name as string) || "the brand";
@@ -42,29 +43,31 @@ Provide a structured audit report covering:
    - Medium-term strategy (1-3 months)
    - Long-term goals (3-6 months)
 
-Format the report in clear sections with actionable insights.`;
+Format the report in clear sections with actionable insights.
+${langHint}`;
 
   try {
-    const report = await claudeCompletion(env, prompt, 3000, String(config.model || "auto"));
+    const preferredModel = String(config.model || "auto");
+    const { content: report, model } = await claudeCompletionWithMeta(env, prompt, 3000, preferredModel);
 
     const summary = `Social presence audit completed for ${projectName}`;
     await updateTaskStatus(env.DATABASE_URL, agentId, 0, "completed", summary);
-    await saveReport(env.DATABASE_URL, agentId, "Social Media Audit", summary, {
+    await saveReport(env.DATABASE_URL, agentId, "Social Media Audit", summary, withModelMetrics({
       project: projectName,
       industry,
       report,
-    });
+    }, preferredModel, model));
 
     return { report, project: projectName };
   } catch (e) {
     const msg = `Social audit failed: ${e}`;
-    await updateTaskStatus(env.DATABASE_URL, agentId, 0, "in_progress", msg);
+    await failTask(env.DATABASE_URL, agentId, 0, "Social Media Audit", msg, String(config.model || "auto"));
     return { error: msg };
   }
 }
 
 // Task 1: Create brand voice & content guidelines
-async function createBrandGuidelines(env: Env, agentId: number, config: Record<string, unknown>) {
+async function createBrandGuidelines(env: Env, agentId: number, config: Record<string, unknown>, langHint = "") {
   await updateTaskStatus(env.DATABASE_URL, agentId, 1, "in_progress");
 
   const projectName = (config.project_name as string) || "the brand";
@@ -105,28 +108,30 @@ Generate a complete brand guide covering:
    - Industry hashtags
    - Campaign-specific hashtag format
 
-Format as a professional brand guide document.`;
+Format as a professional brand guide document.
+${langHint}`;
 
   try {
-    const guidelines = await claudeCompletion(env, prompt, 4000, String(config.model || "auto"));
+    const preferredModel = String(config.model || "auto");
+    const { content: guidelines, model } = await claudeCompletionWithMeta(env, prompt, 4000, preferredModel);
 
     const summary = `Brand voice & content guidelines created for ${projectName}`;
     await updateTaskStatus(env.DATABASE_URL, agentId, 1, "completed", summary);
-    await saveReport(env.DATABASE_URL, agentId, "Brand Guidelines", summary, {
+    await saveReport(env.DATABASE_URL, agentId, "Brand Guidelines", summary, withModelMetrics({
       project: projectName,
       guidelines,
-    });
+    }, preferredModel, model));
 
     return { guidelines, project: projectName };
   } catch (e) {
     const msg = `Brand guidelines creation failed: ${e}`;
-    await updateTaskStatus(env.DATABASE_URL, agentId, 1, "in_progress", msg);
+    await failTask(env.DATABASE_URL, agentId, 1, "Brand Guidelines", msg, String(config.model || "auto"));
     return { error: msg };
   }
 }
 
 // Task 2: Build 2-week content queue (posts, threads)
-async function buildContentQueue(env: Env, agentId: number, config: Record<string, unknown>) {
+async function buildContentQueue(env: Env, agentId: number, config: Record<string, unknown>, langHint = "") {
   await updateTaskStatus(env.DATABASE_URL, agentId, 2, "in_progress");
 
   const projectName = (config.project_name as string) || "the brand";
@@ -165,29 +170,31 @@ Generate a complete content queue with:
 - Each post should be ready to copy-paste and publish
 - Vary content formats throughout the 2 weeks
 
-Format as a day-by-day calendar with clear sections.`;
+Format as a day-by-day calendar with clear sections.
+${langHint}`;
 
   try {
-    const contentQueue = await claudeCompletion(env, prompt, 6000, String(config.model || "auto"));
+    const preferredModel = String(config.model || "auto");
+    const { content: contentQueue, model } = await claudeCompletionWithMeta(env, prompt, 6000, preferredModel);
 
     const summary = `2-week content queue built for ${projectName} starting ${today}`;
     await updateTaskStatus(env.DATABASE_URL, agentId, 2, "completed", summary);
-    await saveReport(env.DATABASE_URL, agentId, "Content Queue", summary, {
+    await saveReport(env.DATABASE_URL, agentId, "Content Queue", summary, withModelMetrics({
       project: projectName,
       start_date: today,
       content_queue: contentQueue,
-    });
+    }, preferredModel, model));
 
     return { contentQueue, project: projectName, startDate: today };
   } catch (e) {
     const msg = `Content queue creation failed: ${e}`;
-    await updateTaskStatus(env.DATABASE_URL, agentId, 2, "in_progress", msg);
+    await failTask(env.DATABASE_URL, agentId, 2, "Content Queue", msg, String(config.model || "auto"));
     return { error: msg };
   }
 }
 
 // Task 3: Set up scheduling tool integration
-async function setupSchedulingIntegration(env: Env, agentId: number, config: Record<string, unknown>) {
+async function setupSchedulingIntegration(env: Env, agentId: number, config: Record<string, unknown>, langHint = "") {
   await updateTaskStatus(env.DATABASE_URL, agentId, 3, "in_progress");
 
   const projectName = (config.project_name as string) || "the brand";
@@ -222,28 +229,30 @@ Provide a detailed guide covering:
    - Bulk scheduling tips
    - Template setup for recurring content types
 
-Format as an actionable implementation guide.`;
+Format as an actionable implementation guide.
+${langHint}`;
 
   try {
-    const guide = await claudeCompletion(env, prompt, 3000, String(config.model || "auto"));
+    const preferredModel = String(config.model || "auto");
+    const { content: guide, model } = await claudeCompletionWithMeta(env, prompt, 3000, preferredModel);
 
     const summary = `Scheduling tool integration guide created for ${projectName}`;
     await updateTaskStatus(env.DATABASE_URL, agentId, 3, "completed", summary);
-    await saveReport(env.DATABASE_URL, agentId, "Scheduling Integration", summary, {
+    await saveReport(env.DATABASE_URL, agentId, "Scheduling Integration", summary, withModelMetrics({
       project: projectName,
       guide,
-    });
+    }, preferredModel, model));
 
     return { guide, project: projectName };
   } catch (e) {
     const msg = `Scheduling integration setup failed: ${e}`;
-    await updateTaskStatus(env.DATABASE_URL, agentId, 3, "in_progress", msg);
+    await failTask(env.DATABASE_URL, agentId, 3, "Scheduling Integration", msg, String(config.model || "auto"));
     return { error: msg };
   }
 }
 
 // Task 4: Launch engagement campaign (likes, replies, follows)
-async function launchEngagementCampaign(env: Env, agentId: number, config: Record<string, unknown>) {
+async function launchEngagementCampaign(env: Env, agentId: number, config: Record<string, unknown>, langHint = "") {
   await updateTaskStatus(env.DATABASE_URL, agentId, 4, "in_progress");
 
   const projectName = (config.project_name as string) || "the brand";
@@ -287,28 +296,30 @@ Design a comprehensive engagement campaign covering:
    - Week 3-4: Acceleration (increase volume, start conversations)
    - Month 2+: Optimization (double down on what works)
 
-Format as a ready-to-execute campaign plan.`;
+Format as a ready-to-execute campaign plan.
+${langHint}`;
 
   try {
-    const campaign = await claudeCompletion(env, prompt, 4000, String(config.model || "auto"));
+    const preferredModel = String(config.model || "auto");
+    const { content: campaign, model } = await claudeCompletionWithMeta(env, prompt, 4000, preferredModel);
 
     const summary = `Engagement campaign plan created for ${projectName}`;
     await updateTaskStatus(env.DATABASE_URL, agentId, 4, "completed", summary);
-    await saveReport(env.DATABASE_URL, agentId, "Engagement Campaign", summary, {
+    await saveReport(env.DATABASE_URL, agentId, "Engagement Campaign", summary, withModelMetrics({
       project: projectName,
       campaign,
-    });
+    }, preferredModel, model));
 
     return { campaign, project: projectName };
   } catch (e) {
     const msg = `Engagement campaign creation failed: ${e}`;
-    await updateTaskStatus(env.DATABASE_URL, agentId, 4, "in_progress", msg);
+    await failTask(env.DATABASE_URL, agentId, 4, "Engagement Campaign", msg, String(config.model || "auto"));
     return { error: msg };
   }
 }
 
 // Task 5: Track follower growth & engagement metrics
-async function trackMetrics(env: Env, agentId: number, config: Record<string, unknown>) {
+async function trackMetrics(env: Env, agentId: number, config: Record<string, unknown>, langHint = "") {
   await updateTaskStatus(env.DATABASE_URL, agentId, 5, "in_progress");
 
   const projectName = (config.project_name as string) || "the brand";
@@ -351,22 +362,24 @@ Build a complete analytics and reporting system covering:
    - Set up alerts for: viral content, negative sentiment, unusual engagement drops
    - Competitor monitoring triggers
 
-Format as a practical analytics playbook with templates.`;
+Format as a practical analytics playbook with templates.
+${langHint}`;
 
   try {
-    const framework = await claudeCompletion(env, prompt, 4000, String(config.model || "auto"));
+    const preferredModel = String(config.model || "auto");
+    const { content: framework, model } = await claudeCompletionWithMeta(env, prompt, 4000, preferredModel);
 
     const summary = `Metrics tracking framework created for ${projectName}`;
     await updateTaskStatus(env.DATABASE_URL, agentId, 5, "completed", summary);
-    await saveReport(env.DATABASE_URL, agentId, "Metrics Tracking", summary, {
+    await saveReport(env.DATABASE_URL, agentId, "Metrics Tracking", summary, withModelMetrics({
       project: projectName,
       framework,
-    });
+    }, preferredModel, model));
 
     return { framework, project: projectName };
   } catch (e) {
     const msg = `Metrics tracking setup failed: ${e}`;
-    await updateTaskStatus(env.DATABASE_URL, agentId, 5, "in_progress", msg);
+    await failTask(env.DATABASE_URL, agentId, 5, "Metrics Tracking", msg, String(config.model || "auto"));
     return { error: msg };
   }
 }
@@ -377,19 +390,22 @@ export async function handleSocial(
   taskIndex: number,
   config: Record<string, unknown>
 ) {
+  const userLocale = (config.locale as string) || "en";
+  const langHint = localeInstruction(userLocale);
+
   switch (taskIndex) {
     case 0:
-      return auditSocialPresence(env, agentId, config);
+      return auditSocialPresence(env, agentId, config, langHint);
     case 1:
-      return createBrandGuidelines(env, agentId, config);
+      return createBrandGuidelines(env, agentId, config, langHint);
     case 2:
-      return buildContentQueue(env, agentId, config);
+      return buildContentQueue(env, agentId, config, langHint);
     case 3:
-      return setupSchedulingIntegration(env, agentId, config);
+      return setupSchedulingIntegration(env, agentId, config, langHint);
     case 4:
-      return launchEngagementCampaign(env, agentId, config);
+      return launchEngagementCampaign(env, agentId, config, langHint);
     case 5:
-      return trackMetrics(env, agentId, config);
+      return trackMetrics(env, agentId, config, langHint);
     default:
       return { error: `Task ${taskIndex} not implemented` };
   }

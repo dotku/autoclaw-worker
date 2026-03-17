@@ -16,4 +16,11 @@ compatibility_date = "2024-12-30"
 [vars]
 ENVIRONMENT = "development"
 
+# Self service binding — allows the worker to call itself, creating a new
+# invocation with a fresh 50-subrequest budget.  Used by /run-all to chain
+# tasks without hitting the Cloudflare subrequest limit.
+[[services]]
+binding = "SELF"
+service = "autoclaw-worker"
+
 # Scheduling is handled externally (for example GitHub Actions or Vercel cron).

@@ -1,5 +1,6 @@
-import { updateTaskStatus, saveReport, getDb } from "../lib/db";
-import { cerebrasCompletion } from "../lib/ai";
+import { updateTaskStatus, saveReport, getDb, withModelMetrics, failTask } from "../lib/db";
+import { cerebrasCompletionWithMeta } from "../lib/ai";
+import { localeInstruction } from "../lib/locale";
 
 interface Env {
   DATABASE_URL: string;
@@ -78,7 +79,7 @@ function getRepoOrError(env: Env, config: DevAgentConfig): { repo?: string; erro
 }
 
 // Task 0: Competitor Research — analyze configurable market competitors
-async function competitorResearch(env: Env, agentId: number, config: DevAgentConfig) {
+async function competitorResearch(env: Env, agentId: number, config: DevAgentConfig, langHint = "") {
   await updateTaskStatus(env.DATABASE_URL, agentId, 0, "in_progress");
   const product = getProductContext(env, config);
 
@@ -129,27 +130,29 @@ Then provide a **Priority Feature Matrix** ranked by:
 - Implementation complexity (low/medium/high)
 - Revenue potential
 
-Format as structured markdown. Be specific and actionable.`;
+Format as structured markdown. Be specific and actionable.
+${langHint}`;
 
   try {
-    const analysis = await cerebrasCompletion(env, prompt, 4000, String(config.model || "auto"));
+    const preferredModel = String(config.model || "auto");
+    const { content: analysis, model } = await cerebrasCompletionWithMeta(env, prompt, 4000, preferredModel);
 
     await updateTaskStatus(env.DATABASE_URL, agentId, 0, "completed", analysis);
-    await saveReport(env.DATABASE_URL, agentId, "Competitor Research", analysis, {
+    await saveReport(env.DATABASE_URL, agentId, "Competitor Research", analysis, withModelMetrics({
       competitors_analyzed: competitors.length,
       focus_areas: focusAreas.length,
-    });
+    }, preferredModel, model));
 
     return { success: true, competitors_analyzed: competitors.length };
   } catch (e) {
     const msg = `Competitor research failed: ${e}`;
-    await updateTaskStatus(env.DATABASE_URL, agentId, 0, "completed", msg);
+    await failTask(env.DATABASE_URL, agentId, 0, "Competitor Research", msg, "auto");
     return { error: msg };
   }
 }
 
 // Task 1: Feature Gap Analysis — compare and prioritize
-async function featureGapAnalysis(env: Env, agentId: number, config: DevAgentConfig) {
+async function featureGapAnalysis(env: Env, agentId: number, config: DevAgentConfig, langHint = "") {
   await updateTaskStatus(env.DATABASE_URL, agentId, 1, "in_progress");
   const product = getProductContext(env, config);
 
@@ -196,26 +199,28 @@ Based on the competitor analysis, create a detailed feature gap analysis with im
 4. **Data Management**: upload/storage, version history, sharing
 5. **Notifications**: email, in-app, webhooks
 
-Produce a structured sprint plan with 2-week sprints. Format as markdown with clear sections.`;
+Produce a structured sprint plan with 2-week sprints. Format as markdown with clear sections.
+${langHint}`;
 
   try {
-    const analysis = await cerebrasCompletion(env, prompt, 4000, String(config.model || "auto"));
+    const preferredModel = String(config.model || "auto");
+    const { content: analysis, model } = await cerebrasCompletionWithMeta(env, prompt, 4000, preferredModel);
 
     await updateTaskStatus(env.DATABASE_URL, agentId, 1, "completed", analysis);
-    await saveReport(env.DATABASE_URL, agentId, "Feature Gap Analysis", analysis, {
+    await saveReport(env.DATABASE_URL, agentId, "Feature Gap Analysis", analysis, withModelMetrics({
       based_on_research: latestResearch.length > 0 ? "yes" : "no",
-    });
+    }, preferredModel, model));
 
     return { success: true };
   } catch (e) {
     const msg = `Feature gap analysis failed: ${e}`;
-    await updateTaskStatus(env.DATABASE_URL, agentId, 1, "completed", msg);
+    await failTask(env.DATABASE_URL, agentId, 1, "Feature Gap Analysis", msg, "auto");
     return { error: msg };
   }
 }
 
 // Task 2: Create GitHub Issues — auto-create issues from gap analysis
-async function createGitHubIssues(env: Env, agentId: number, config: DevAgentConfig) {
+async function createGitHubIssues(env: Env, agentId: number, config: DevAgentConfig, langHint = "") {
   await updateTaskStatus(env.DATABASE_URL, agentId, 2, "in_progress");
   const repoInfo = getRepoOrError(env, config);
   if (repoInfo.error) {
@@ -265,10 +270,12 @@ Return a JSON array (no markdown, pure JSON) with exactly 5 items:
 
 Priority labels: priority-p0, priority-p1, priority-p2
 Category labels: user-system, payment, workflow, data, notifications
-Always include "auto-generated" label.`;
+Always include "auto-generated" label.
+${langHint}`;
 
   try {
-    const issuesJson = await cerebrasCompletion(env, prompt, 3000, String(config.model || "auto"));
+    const preferredModel = String(config.model || "auto");
+    const { content: issuesJson, model } = await cerebrasCompletionWithMeta(env, prompt, 3000, preferredModel);
 
     // Parse the JSON response
     const jsonMatch = issuesJson.match(/\[[\s\S]*\]/);
@@ -319,21 +326,21 @@ Always include "auto-generated" label.`;
     const summary = `Created ${createdIssues.filter((i) => i.number > 0).length}/${issues.length} GitHub issues:\n${createdIssues.map((i) => `- #${i.number}: ${i.title} (${i.url})`).join("\n")}`;
 
     await updateTaskStatus(env.DATABASE_URL, agentId, 2, "completed", summary);
-    await saveReport(env.DATABASE_URL, agentId, "GitHub Issues Created", summary, {
+    await saveReport(env.DATABASE_URL, agentId, "GitHub Issues Created", summary, withModelMetrics({
       issues_created: createdIssues.filter((i) => i.number > 0).length,
       issues_failed: createdIssues.filter((i) => i.number === 0).length,
-    });
+    }, preferredModel, model));
 
     return { success: true, issues: createdIssues };
   } catch (e) {
     const msg = `GitHub issue creation failed: ${e}`;
-    await updateTaskStatus(env.DATABASE_URL, agentId, 2, "completed", msg);
+    await failTask(env.DATABASE_URL, agentId, 2, "GitHub Issues Created", msg, "auto");
     return { error: msg };
   }
 }
 
 // Task 3: Generate Implementation Code — produce code for top priority issue
-async function generateImplementation(env: Env, agentId: number, config: DevAgentConfig) {
+async function generateImplementation(env: Env, agentId: number, config: DevAgentConfig, langHint = "") {
   await updateTaskStatus(env.DATABASE_URL, agentId, 3, "in_progress");
   const repoInfo = getRepoOrError(env, config);
   if (repoInfo.error) {
@@ -418,9 +425,11 @@ Provide a detailed implementation plan in markdown format:
 7. **i18n Keys** — New translation keys needed for en, zh-CN, zh-TW
 8. **Testing Checklist** — How to verify the feature works
 
-Be specific with file paths and code. Use TypeScript, Auth0 for auth, Prisma for DB, Tailwind for styling.`;
+Be specific with file paths and code. Use TypeScript, Auth0 for auth, Prisma for DB, Tailwind for styling.
+${langHint}`;
 
-    const planResponse = await cerebrasCompletion(env, prompt, 4000, String(config.model || "auto"));
+    const preferredModel = String(config.model || "auto");
+    const { content: planResponse, model } = await cerebrasCompletionWithMeta(env, prompt, 4000, preferredModel);
 
     // Post the implementation plan as a comment on the issue
     await fetch(`https://api.github.com/repos/${repo}/issues/${issue.number}/comments`, {
@@ -439,20 +448,20 @@ Be specific with file paths and code. Use TypeScript, Auth0 for auth, Prisma for
     const summary = `Generated implementation plan for issue #${issue.number}: ${issue.title}\n\nPlan posted as comment on the issue.`;
 
     await updateTaskStatus(env.DATABASE_URL, agentId, 3, "completed", summary);
-    await saveReport(env.DATABASE_URL, agentId, "Implementation Plan", summary, {
+    await saveReport(env.DATABASE_URL, agentId, "Implementation Plan", summary, withModelMetrics({
       issue_number: issue.number,
-    });
+    }, preferredModel, model));
 
     return { success: true, issue: issue.number };
   } catch (e) {
     const msg = `Code generation failed: ${e}`;
-    await updateTaskStatus(env.DATABASE_URL, agentId, 3, "completed", msg);
+    await failTask(env.DATABASE_URL, agentId, 3, "Implementation Plan", msg, "auto");
     return { error: msg };
   }
 }
 
 // Task 4: Sprint Progress Report
-async function sprintReport(env: Env, agentId: number, config: DevAgentConfig) {
+async function sprintReport(env: Env, agentId: number, config: DevAgentConfig, langHint = "") {
   await updateTaskStatus(env.DATABASE_URL, agentId, 4, "in_progress");
   const product = getProductContext(env, config);
   const repoInfo = getRepoOrError(env, config);
@@ -527,20 +536,22 @@ Generate a concise sprint report for ${product.productName} with:
 5. **Next Sprint Priorities** — top 3 items for next cycle
 6. **Velocity Metrics** — issues opened vs closed, code generation success rate
 
-Format as markdown. Keep it actionable and concise.`;
+Format as markdown. Keep it actionable and concise.
+${langHint}`;
 
   try {
-    const report = await cerebrasCompletion(env, prompt, 1500, String(config.model || "auto"));
+    const preferredModel = String(config.model || "auto");
+    const { content: report, model } = await cerebrasCompletionWithMeta(env, prompt, 1500, preferredModel);
 
     await updateTaskStatus(env.DATABASE_URL, agentId, 4, "completed", report);
-    await saveReport(env.DATABASE_URL, agentId, "Sprint Progress Report", report, {
+    await saveReport(env.DATABASE_URL, agentId, "Sprint Progress Report", report, withModelMetrics({
       total_reports: reports.length,
-    });
+    }, preferredModel, model));
 
     return { success: true };
   } catch (e) {
     const msg = `Sprint report failed: ${e}`;
-    await updateTaskStatus(env.DATABASE_URL, agentId, 4, "completed", msg);
+    await failTask(env.DATABASE_URL, agentId, 4, "Sprint Progress Report", msg, "auto");
     return { error: msg };
   }
 }
@@ -552,18 +563,20 @@ export async function handleDevAgent(
   config: Record<string, unknown>
 ) {
   const devConfig = config as unknown as DevAgentConfig;
+  const userLocale = (config.locale as string) || "en";
+  const langHint = localeInstruction(userLocale);
 
   switch (taskIndex) {
     case 0:
-      return competitorResearch(env, agentId, devConfig);
+      return competitorResearch(env, agentId, devConfig, langHint);
     case 1:
-      return featureGapAnalysis(env, agentId, devConfig);
+      return featureGapAnalysis(env, agentId, devConfig, langHint);
     case 2:
-      return createGitHubIssues(env, agentId, devConfig);
+      return createGitHubIssues(env, agentId, devConfig, langHint);
     case 3:
-      return generateImplementation(env, agentId, devConfig);
+      return generateImplementation(env, agentId, devConfig, langHint);
     case 4:
-      return sprintReport(env, agentId, devConfig);
+      return sprintReport(env, agentId, devConfig, langHint);
     default:
       return { error: `Task ${taskIndex} not implemented for dev_agent` };
   }

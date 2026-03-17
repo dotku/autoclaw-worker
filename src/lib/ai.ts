@@ -18,11 +18,16 @@ type SupportedModel =
   | "alibaba/qwen-plus"
   | "alibaba/qwen-turbo";
 
+export interface CompletionResult {
+  content: string;
+  model: Exclude<SupportedModel, "auto">;
+}
+
 async function runCerebras(
   env: CerebrasEnv,
   prompt: string,
   maxTokens = 1500
-): Promise<string> {
+): Promise<CompletionResult> {
   if (!env.CEREBRAS_API_KEY) {
     throw new Error("CEREBRAS_API_KEY not configured");
   }
@@ -44,14 +49,14 @@ async function runCerebras(
   const data = (await res.json()) as {
     choices: { message: { content: string } }[];
   };
-  return data.choices[0].message.content;
+  return { content: data.choices[0].message.content, model: "cerebras/gpt-oss-120b" };
 }
 
 async function runClaude(
   env: ClaudeEnv,
   prompt: string,
   maxTokens = 2000
-): Promise<string> {
+): Promise<CompletionResult> {
   // Prefer Vercel AI Gateway
   if (env.AI_GATEWAY_API_KEY) {
     const res = await fetch("https://ai-gateway.vercel.sh/v1/messages", {
@@ -76,7 +81,7 @@ async function runClaude(
     const data = (await res.json()) as {
       content: { type: string; text: string }[];
     };
-    return data.content[0].text;
+    return { content: data.content[0].text, model: "anthropic/claude-sonnet-4.5" };
   }
 
   // Direct Anthropic
@@ -103,7 +108,7 @@ async function runClaude(
     const data = (await res.json()) as {
       content: { type: string; text: string }[];
     };
-    return data.content[0].text;
+    return { content: data.content[0].text, model: "anthropic/claude-sonnet-4.5" };
   }
 
   throw new Error("No Claude API key configured (AI_GATEWAY_API_KEY or ANTHROPIC_API_KEY)");
@@ -114,7 +119,7 @@ async function runAlibaba(
   prompt: string,
   model: "qwen-plus" | "qwen-turbo",
   maxTokens = 2000
-): Promise<string> {
+): Promise<CompletionResult> {
   if (!env.ALIBABA_API_KEY) {
     throw new Error("Alibaba API key is invalid or missing. Add a valid Alibaba key in Settings > Market before using Qwen models.");
   }
@@ -141,16 +146,19 @@ async function runAlibaba(
   const data = (await res.json()) as {
     choices: { message: { content: string } }[];
   };
-  return data.choices[0]?.message?.content || "";
+  return {
+    content: data.choices[0]?.message?.content || "",
+    model: model === "qwen-plus" ? "alibaba/qwen-plus" : "alibaba/qwen-turbo",
+  };
 }
 
 // Fast & cheap by default — for SEO keyword research, ICP analysis, etc.
-export async function cerebrasCompletion(
+export async function cerebrasCompletionWithMeta(
   env: CerebrasEnv & ClaudeEnv,
   prompt: string,
   maxTokens = 1500,
   preferredModel = "auto"
-): Promise<string> {
+): Promise<CompletionResult> {
   const model = preferredModel as SupportedModel;
 
   if (model === "anthropic/claude-sonnet-4.5") {
@@ -171,21 +179,33 @@ export async function cerebrasCompletion(
 
   try {
     return await runCerebras(env, prompt, maxTokens);
-  } catch {
-    if (model !== "cerebras/gpt-oss-120b") {
+  } catch (cerebrasErr) {
+    // Always try Claude as fallback, regardless of preferred model
+    try {
       return await runClaude(env, prompt, maxTokens);
+    } catch {
+      throw new Error(`All models failed. Cerebras: ${cerebrasErr}. Ensure CEREBRAS_API_KEY or ANTHROPIC_API_KEY is configured.`);
     }
-    throw new Error("Preferred model unavailable: cerebras/gpt-oss-120b");
   }
 }
 
+export async function cerebrasCompletion(
+  env: CerebrasEnv & ClaudeEnv,
+  prompt: string,
+  maxTokens = 1500,
+  preferredModel = "auto"
+): Promise<string> {
+  const result = await cerebrasCompletionWithMeta(env, prompt, maxTokens, preferredModel);
+  return result.content;
+}
+
 // High quality by default — for writing emails, marketing copy
-export async function claudeCompletion(
+export async function claudeCompletionWithMeta(
   env: ClaudeEnv & CerebrasEnv,
   prompt: string,
   maxTokens = 2000,
   preferredModel = "auto"
-): Promise<string> {
+): Promise<CompletionResult> {
   const model = preferredModel as SupportedModel;
 
   if (model === "cerebras/gpt-oss-120b") {
@@ -206,10 +226,21 @@ export async function claudeCompletion(
 
   try {
     return await runClaude(env, prompt, maxTokens);
-  } catch {
-    if (model !== "anthropic/claude-sonnet-4.5") {
+  } catch (claudeErr) {
+    try {
       return await runCerebras(env, prompt, maxTokens);
+    } catch {
+      throw new Error(`All models failed. Claude: ${claudeErr}. Ensure ANTHROPIC_API_KEY or CEREBRAS_API_KEY is configured.`);
     }
-    throw new Error("Preferred model unavailable: anthropic/claude-sonnet-4.5");
   }
+}
+
+export async function claudeCompletion(
+  env: ClaudeEnv & CerebrasEnv,
+  prompt: string,
+  maxTokens = 2000,
+  preferredModel = "auto"
+): Promise<string> {
+  const result = await claudeCompletionWithMeta(env, prompt, maxTokens, preferredModel);
+  return result.content;
 }
