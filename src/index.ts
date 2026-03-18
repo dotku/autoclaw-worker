@@ -1,4 +1,4 @@
-import { getDb, updateTaskStatus } from "./lib/db";
+import { getDb, updateTaskStatus, resetTaskForRecurring } from "./lib/db";
 import { handleSEO } from "./handlers/seo";
 import { handleLeads } from "./handlers/leads";
 import { handleEmail } from "./handlers/email";
@@ -48,6 +48,7 @@ interface TaskRequest {
   // These are passed from the Vercel API for context
   project_id?: number;
   user_id?: number;
+  caller_id?: number; // The user who triggered execution (may differ from agent owner)
   locale?: string;
 }
 
@@ -84,8 +85,9 @@ function json(data: unknown, status = 200) {
 async function resolveRuntimeEnv(
   env: Env,
   sql: ReturnType<typeof getDb>,
-  userId: number,
-  config: Record<string, unknown>
+  ownerId: number,
+  config: Record<string, unknown>,
+  callerId?: number,
 ): Promise<Env> {
   const runtimeEnv: Env = { ...env };
   const preferredModel = String(config.model || "auto");
@@ -95,58 +97,56 @@ async function resolveRuntimeEnv(
     return runtimeEnv;
   }
 
-  // Load BYOK keys (email providers + lead enrichment + AI models)
-  // 1. User's own keys first
-  const byokKeys = await sql`
-    SELECT service, api_key
-    FROM user_api_keys
-    WHERE user_id = ${userId} AND service IN ('sendgrid', 'brevo', 'apollo', 'apify', 'hunter', 'snov_api_id', 'snov_api_secret', 'cerebras', 'anthropic', 'openai', 'google', 'vercel')
-  `;
-  for (const row of byokKeys) {
-    try {
-      const decrypted = await decryptApiKey(String(row.api_key), runtimeEnv.ENCRYPTION_KEY);
-      if (row.service === "sendgrid") runtimeEnv.SENDGRID_API_KEY = decrypted;
-      if (row.service === "brevo") runtimeEnv.BREVO_API_KEY = decrypted;
-      if (row.service === "apollo") runtimeEnv.APOLLO_API_KEY = decrypted;
-      if (row.service === "apify") runtimeEnv.APIFY_API_TOKEN = decrypted;
-      if (row.service === "hunter") runtimeEnv.HUNTER_API_KEY = decrypted;
-      if (row.service === "snov_api_id") runtimeEnv.SNOV_API_ID = decrypted;
-      if (row.service === "snov_api_secret") runtimeEnv.SNOV_API_SECRET = decrypted;
-      // AI model keys
-      if (row.service === "cerebras" && !runtimeEnv.CEREBRAS_API_KEY) runtimeEnv.CEREBRAS_API_KEY = decrypted;
-      if (row.service === "anthropic" && !runtimeEnv.ANTHROPIC_API_KEY) runtimeEnv.ANTHROPIC_API_KEY = decrypted;
-      if (row.service === "vercel" && !runtimeEnv.AI_GATEWAY_API_KEY) runtimeEnv.AI_GATEWAY_API_KEY = decrypted;
-    } catch {
-      // Skip if decryption fails
+  const BYOK_SERVICES = "('sendgrid', 'brevo', 'apollo', 'apify', 'hunter', 'snov_api_id', 'snov_api_secret', 'cerebras', 'anthropic', 'openai', 'google', 'vercel')";
+
+  // Helper: apply a set of decrypted keys to runtimeEnv (only fill missing slots)
+  const applyKeys = async (rows: Record<string, unknown>[]) => {
+    for (const row of rows) {
+      try {
+        const decrypted = await decryptApiKey(String(row.api_key), runtimeEnv.ENCRYPTION_KEY!);
+        const svc = row.service as string;
+        if (svc === "sendgrid" && !runtimeEnv.SENDGRID_API_KEY) runtimeEnv.SENDGRID_API_KEY = decrypted;
+        if (svc === "brevo" && !runtimeEnv.BREVO_API_KEY) runtimeEnv.BREVO_API_KEY = decrypted;
+        if (svc === "apollo" && !runtimeEnv.APOLLO_API_KEY) runtimeEnv.APOLLO_API_KEY = decrypted;
+        if (svc === "apify" && !runtimeEnv.APIFY_API_TOKEN) runtimeEnv.APIFY_API_TOKEN = decrypted;
+        if (svc === "hunter" && !runtimeEnv.HUNTER_API_KEY) runtimeEnv.HUNTER_API_KEY = decrypted;
+        if (svc === "snov_api_id" && !runtimeEnv.SNOV_API_ID) runtimeEnv.SNOV_API_ID = decrypted;
+        if (svc === "snov_api_secret" && !runtimeEnv.SNOV_API_SECRET) runtimeEnv.SNOV_API_SECRET = decrypted;
+        if (svc === "cerebras" && !runtimeEnv.CEREBRAS_API_KEY) runtimeEnv.CEREBRAS_API_KEY = decrypted;
+        if (svc === "anthropic" && !runtimeEnv.ANTHROPIC_API_KEY) runtimeEnv.ANTHROPIC_API_KEY = decrypted;
+        if (svc === "vercel" && !runtimeEnv.AI_GATEWAY_API_KEY) runtimeEnv.AI_GATEWAY_API_KEY = decrypted;
+      } catch {
+        // Skip if decryption fails
+      }
     }
+  };
+
+  // Key resolution order:
+  // 1. Caller's personal keys (the user who triggered execution)
+  // 2. Owner's personal keys (the agent/project owner)
+  // 3. Caller's org keys
+  // 4. Owner's org keys
+  // 5. Environment variables (already in runtimeEnv from spread)
+
+  const userIds = callerId && callerId !== ownerId ? [callerId, ownerId] : [ownerId];
+
+  for (const uid of userIds) {
+    const userKeys = await sql`
+      SELECT service, api_key FROM user_api_keys
+      WHERE user_id = ${uid} AND service IN ('sendgrid', 'brevo', 'apollo', 'apify', 'hunter', 'snov_api_id', 'snov_api_secret', 'cerebras', 'anthropic', 'openai', 'google', 'vercel')
+    `;
+    await applyKeys(userKeys);
   }
 
-  // 2. Fall back to org-level keys for any missing services
-  const orgKeys = await sql`
-    SELECT ok.service, ok.api_key
-    FROM org_api_keys ok
-    JOIN organization_members om ON ok.org_id = om.org_id
-    WHERE om.user_id = ${userId}
-      AND ok.service IN ('sendgrid', 'brevo', 'apollo', 'apify', 'hunter', 'snov_api_id', 'snov_api_secret', 'cerebras', 'anthropic', 'openai', 'google', 'vercel')
-  `;
-  for (const row of orgKeys) {
-    try {
-      const decrypted = await decryptApiKey(String(row.api_key), runtimeEnv.ENCRYPTION_KEY);
-      // Only set if not already resolved from user keys or env
-      if (row.service === "sendgrid" && !runtimeEnv.SENDGRID_API_KEY) runtimeEnv.SENDGRID_API_KEY = decrypted;
-      if (row.service === "brevo" && !runtimeEnv.BREVO_API_KEY) runtimeEnv.BREVO_API_KEY = decrypted;
-      if (row.service === "apollo" && !runtimeEnv.APOLLO_API_KEY) runtimeEnv.APOLLO_API_KEY = decrypted;
-      if (row.service === "apify" && !runtimeEnv.APIFY_API_TOKEN) runtimeEnv.APIFY_API_TOKEN = decrypted;
-      if (row.service === "hunter" && !runtimeEnv.HUNTER_API_KEY) runtimeEnv.HUNTER_API_KEY = decrypted;
-      if (row.service === "snov_api_id" && !runtimeEnv.SNOV_API_ID) runtimeEnv.SNOV_API_ID = decrypted;
-      if (row.service === "snov_api_secret" && !runtimeEnv.SNOV_API_SECRET) runtimeEnv.SNOV_API_SECRET = decrypted;
-      // AI model keys
-      if (row.service === "cerebras" && !runtimeEnv.CEREBRAS_API_KEY) runtimeEnv.CEREBRAS_API_KEY = decrypted;
-      if (row.service === "anthropic" && !runtimeEnv.ANTHROPIC_API_KEY) runtimeEnv.ANTHROPIC_API_KEY = decrypted;
-      if (row.service === "vercel" && !runtimeEnv.AI_GATEWAY_API_KEY) runtimeEnv.AI_GATEWAY_API_KEY = decrypted;
-    } catch {
-      // Skip if decryption fails
-    }
+  for (const uid of userIds) {
+    const orgKeys = await sql`
+      SELECT ok.service, ok.api_key
+      FROM org_api_keys ok
+      JOIN organization_members om ON ok.org_id = om.org_id
+      WHERE om.user_id = ${uid}
+        AND ok.service IN ('sendgrid', 'brevo', 'apollo', 'apify', 'hunter', 'snov_api_id', 'snov_api_secret', 'cerebras', 'anthropic', 'openai', 'google', 'vercel')
+    `;
+    await applyKeys(orgKeys);
   }
 
   if (!needsAlibaba) {
@@ -156,27 +156,28 @@ async function resolveRuntimeEnv(
   // Qwen models are strict BYOK. Do not fall back to a system-level Alibaba key.
   delete runtimeEnv.ALIBABA_API_KEY;
 
-  // Check user's own key first, then org key
-  const rows = await sql`
-    SELECT api_key FROM user_api_keys WHERE user_id = ${userId} AND service = 'alibaba' LIMIT 1
-  `;
-  if (rows.length === 0) {
-    const orgRows = await sql`
+  // Check caller + owner keys for Alibaba
+  for (const uid of userIds) {
+    const alibabaRows = await sql`
+      SELECT api_key FROM user_api_keys WHERE user_id = ${uid} AND service = 'alibaba' LIMIT 1
+    `;
+    if (alibabaRows.length > 0) {
+      try {
+        runtimeEnv.ALIBABA_API_KEY = await decryptApiKey(String(alibabaRows[0].api_key), runtimeEnv.ENCRYPTION_KEY);
+        break;
+      } catch { /* skip */ }
+    }
+    const orgAlibabaRows = await sql`
       SELECT ok.api_key FROM org_api_keys ok
       JOIN organization_members om ON ok.org_id = om.org_id
-      WHERE om.user_id = ${userId} AND ok.service = 'alibaba' LIMIT 1
+      WHERE om.user_id = ${uid} AND ok.service = 'alibaba' LIMIT 1
     `;
-    if (orgRows.length === 0) return runtimeEnv;
-    try {
-      runtimeEnv.ALIBABA_API_KEY = await decryptApiKey(String(orgRows[0].api_key), runtimeEnv.ENCRYPTION_KEY);
-    } catch { /* skip */ }
-    return runtimeEnv;
-  }
-
-  try {
-    runtimeEnv.ALIBABA_API_KEY = await decryptApiKey(String(rows[0].api_key), runtimeEnv.ENCRYPTION_KEY);
-  } catch {
-    // Keep runtime env without Alibaba credentials if BYOK decryption fails.
+    if (orgAlibabaRows.length > 0) {
+      try {
+        runtimeEnv.ALIBABA_API_KEY = await decryptApiKey(String(orgAlibabaRows[0].api_key), runtimeEnv.ENCRYPTION_KEY);
+        break;
+      } catch { /* skip */ }
+    }
   }
 
   return runtimeEnv;
@@ -262,9 +263,17 @@ async function runCronBatch(env: Env, body: CronBody = {}): Promise<CronResult> 
         case "lead_prospecting":
           await handleLeads(runtimeEnv, agentId, nextIdx, config, projectId, userId);
           break;
-        case "email_marketing":
-          await handleEmail(runtimeEnv, agentId, nextIdx, config, projectId, userId);
+        case "email_marketing": {
+          const emailResult = await handleEmail(runtimeEnv, agentId, nextIdx, config, projectId, userId);
+          // Auto-reset Task 5 if there are remaining unsent leads for next cron cycle
+          if (nextIdx === 5 && emailResult && typeof emailResult === "object" && "remaining" in emailResult) {
+            const remaining = (emailResult as { remaining?: number }).remaining || 0;
+            if (remaining > 0) {
+              await resetTaskForRecurring(env.DATABASE_URL, agentId, 5);
+            }
+          }
           break;
+        }
         case "product_manager":
           await handleMonitor(runtimeEnv, agentId, nextIdx, config);
           break;
@@ -324,13 +333,25 @@ export default {
     }
 
     // POST /execute — run a specific agent task
+    // If called externally, delegate to SELF binding for a fresh subrequest budget.
+    // The _internal flag means we're already in a SELF invocation — execute directly.
     if (request.method === "POST" && url.pathname === "/execute") {
       try {
-        const body = (await request.json()) as TaskRequest;
-        const { agent_id, task_index, project_id, user_id, locale } = body;
+        const body = (await request.json()) as TaskRequest & { _internal?: boolean };
+        const { agent_id, task_index, project_id, user_id, caller_id, locale } = body;
 
         if (!agent_id || task_index === undefined) {
           return json({ error: "agent_id and task_index required" }, 400);
+        }
+
+        // Delegate to SELF for a fresh subrequest budget (avoids 50-subrequest limit)
+        if (!body._internal && env.SELF) {
+          const selfRes = await env.SELF.fetch(new Request(request.url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${env.WORKER_AUTH_SECRET}` },
+            body: JSON.stringify({ ...body, _internal: true }),
+          }));
+          return new Response(selfRes.body, { status: selfRes.status, headers: selfRes.headers });
         }
 
         // Load agent config from DB
@@ -350,11 +371,13 @@ export default {
         const config = await enrichConfigWithProject(sql, (agent.config as Record<string, unknown>) || {}, project_id || (agent.project_id as number));
         if (locale) config.locale = locale;
         const agentProjectId = project_id || (agent.project_id as number);
-        const agentUserId = user_id || (agent.user_id as number);
-        const runtimeEnv = await resolveRuntimeEnv(env, sql, agentUserId, config);
+        const agentOwnerId = agent.user_id as number;
+        const agentCallerId = caller_id || user_id;
+        const runtimeEnv = await resolveRuntimeEnv(env, sql, agentOwnerId, config, agentCallerId);
 
         let result: unknown;
         const useMode = String(config.model || "auto");
+        const agentUserId = user_id || agentOwnerId;
 
         switch (agent.agent_type) {
           case "seo_content":
@@ -405,6 +428,14 @@ export default {
               }
             }
           } catch { /* non-critical */ }
+        }
+
+        // Auto-reset email_marketing Task 5 if unsent leads remain
+        if (agent.agent_type === "email_marketing" && task_index === 5 && result && typeof result === "object" && "remaining" in result) {
+          const remaining = (result as { remaining?: number }).remaining || 0;
+          if (remaining > 0) {
+            await resetTaskForRecurring(env.DATABASE_URL, agent_id, 5);
+          }
         }
 
         // Stamp model_used and use_mode onto the completed task config
@@ -543,6 +574,14 @@ export default {
               break;
             default:
               result = { error: `Agent type "${agentType}" not yet supported` };
+          }
+
+          // Auto-reset email_marketing Task 5 if unsent leads remain
+          if (agentType === "email_marketing" && nextTaskIndex === 5 && result && typeof result === "object" && "remaining" in result) {
+            const remaining = (result as { remaining?: number }).remaining || 0;
+            if (remaining > 0) {
+              await resetTaskForRecurring(env.DATABASE_URL, agent_id, 5);
+            }
           }
 
           // Stamp model_used onto task config

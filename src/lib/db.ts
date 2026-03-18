@@ -4,6 +4,53 @@ export function getDb(databaseUrl: string) {
   return neon(databaseUrl);
 }
 
+/**
+ * Log a real-time execution step so the frontend can display "thinking" progress.
+ * status: "running" | "done" | "error"
+ */
+export async function logStep(
+  databaseUrl: string,
+  agentId: number,
+  taskIndex: number,
+  stepKey: string,
+  status: "running" | "done" | "error" = "running",
+  detail?: string,
+) {
+  const sql = getDb(databaseUrl);
+  try {
+    if (status === "running") {
+      await sql`
+        INSERT INTO agent_steps (agent_id, task_index, step_key, status, detail)
+        VALUES (${agentId}, ${taskIndex}, ${stepKey}, ${status}, ${detail || null})
+      `;
+    } else {
+      // Update existing running step to done/error
+      const updated = await sql`
+        UPDATE agent_steps SET status = ${status}, detail = COALESCE(${detail || null}, detail)
+        WHERE agent_id = ${agentId} AND task_index = ${taskIndex} AND step_key = ${stepKey} AND status = 'running'
+        RETURNING id
+      `;
+      if (updated.length === 0) {
+        // No running step found — insert directly
+        await sql`
+          INSERT INTO agent_steps (agent_id, task_index, step_key, status, detail)
+          VALUES (${agentId}, ${taskIndex}, ${stepKey}, ${status}, ${detail || null})
+        `;
+      }
+    }
+  } catch { /* non-critical — don't block task execution */ }
+}
+
+/**
+ * Clear old steps for a task before re-running it.
+ */
+export async function clearSteps(databaseUrl: string, agentId: number, taskIndex: number) {
+  const sql = getDb(databaseUrl);
+  try {
+    await sql`DELETE FROM agent_steps WHERE agent_id = ${agentId} AND task_index = ${taskIndex}`;
+  } catch { /* non-critical */ }
+}
+
 export async function updateTaskStatus(
   databaseUrl: string,
   agentId: number,
@@ -109,6 +156,31 @@ export async function failTask(
     preferred_model: preferredModel,
     model_used: "none",
   }, taskIndex);
+}
+
+/**
+ * Reset a single completed task back to "pending" so the cron picks it up again.
+ * Used for recurring tasks like email_marketing Task 5 (batch outreach).
+ */
+export async function resetTaskForRecurring(
+  databaseUrl: string,
+  agentId: number,
+  taskIndex: number,
+) {
+  const sql = getDb(databaseUrl);
+  const agents = await sql`SELECT config FROM agent_assignments WHERE id = ${agentId}`;
+  if (agents.length === 0) return;
+
+  const config = agents[0].config as {
+    tasks?: { name: string; status: string; result?: string }[];
+  };
+  const tasks = config.tasks || [];
+
+  if (taskIndex >= 0 && taskIndex < tasks.length && tasks[taskIndex].status === "completed") {
+    tasks[taskIndex].status = "pending";
+    const updatedConfig = { ...config, tasks };
+    await sql`UPDATE agent_assignments SET config = ${JSON.stringify(updatedConfig)} WHERE id = ${agentId}`;
+  }
 }
 
 export function withModelMetrics(

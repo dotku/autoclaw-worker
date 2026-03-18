@@ -1,4 +1,4 @@
-import { updateTaskStatus, saveReport, failTask, getDb, withModelMetrics } from "../lib/db";
+import { updateTaskStatus, saveReport, failTask, getDb, withModelMetrics, logStep, clearSteps } from "../lib/db";
 import { cerebrasCompletionWithMeta } from "../lib/ai";
 import { localeInstruction, t as tl } from "../lib/locale";
 
@@ -30,7 +30,7 @@ async function searchApollo(apiKey: string, domain: string): Promise<Lead[]> {
     body: JSON.stringify({ q_organization_domains: domain, page: 1, per_page: 25 }),
   });
   if (!res.ok) {
-    if (res.status === 403) return []; // free plan — skip silently
+    if (res.status === 403) return []; // Apollo free plan — people search not available
     const text = await res.text().catch(() => "");
     throw new Error(`Apollo API error ${res.status}: ${text.substring(0, 200)}`);
   }
@@ -168,6 +168,119 @@ async function searchApify(apiToken: string, domain: string): Promise<Lead[]> {
     }));
 }
 
+// Apify: Crawl website with JS rendering (for SPAs that return blank on basic fetch)
+async function crawlWebsiteApify(apiToken: string, url: string): Promise<string> {
+  const startRes = await fetch(
+    `https://api.apify.com/v2/acts/apify~website-content-crawler/runs?token=${apiToken}&waitForFinish=120`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        startUrls: [{ url }],
+        maxCrawlDepth: 0,
+        maxCrawlPages: 3,
+        crawlerType: "playwright:firefox",
+      }),
+    },
+  );
+  if (!startRes.ok) {
+    const text = await startRes.text().catch(() => "");
+    throw new Error(`Apify crawler start error ${startRes.status}: ${text.substring(0, 200)}`);
+  }
+  const runData = await startRes.json() as { data?: { id?: string; status?: string; defaultDatasetId?: string } };
+  const run = runData.data;
+  if (!run?.id) throw new Error("Apify crawler: no run ID returned");
+
+  let datasetId = run.defaultDatasetId;
+  if (run.status !== "SUCCEEDED" && run.status !== "FAILED") {
+    const pollRes = await fetch(
+      `https://api.apify.com/v2/actor-runs/${run.id}?token=${apiToken}&waitForFinish=120`,
+    );
+    if (pollRes.ok) {
+      const pollData = await pollRes.json() as { data?: { status?: string; defaultDatasetId?: string } };
+      if (pollData.data?.status === "FAILED" || pollData.data?.status === "ABORTED") {
+        throw new Error(`Apify crawler run ${pollData.data.status}`);
+      }
+      datasetId = pollData.data?.defaultDatasetId || datasetId;
+    }
+  } else if (run.status === "FAILED") {
+    throw new Error("Apify crawler run failed");
+  }
+
+  if (!datasetId) throw new Error("Apify crawler: no dataset ID");
+
+  const itemsRes = await fetch(
+    `https://api.apify.com/v2/datasets/${datasetId}/items?token=${apiToken}&limit=5`,
+  );
+  if (!itemsRes.ok) throw new Error(`Apify crawler dataset error ${itemsRes.status}`);
+  const items = (await itemsRes.json()) as { url?: string; text?: string; metadata?: { title?: string; description?: string } }[];
+
+  const parts: string[] = [];
+  for (const item of items) {
+    if (item.metadata?.title) parts.push(`Title: ${item.metadata.title}`);
+    if (item.metadata?.description) parts.push(`Description: ${item.metadata.description}`);
+    if (item.text) parts.push(item.text.substring(0, 1500));
+  }
+  return parts.join("\n").substring(0, 3000);
+}
+
+// Apify: Google Search to gather public info about a company
+async function searchGoogleApify(apiToken: string, queries: string[]): Promise<string> {
+  const startRes = await fetch(
+    `https://api.apify.com/v2/acts/apify~google-search-scraper/runs?token=${apiToken}&waitForFinish=60`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        queries: queries.join("\n"),
+        maxPagesPerQuery: 1,
+        resultsPerPage: 5,
+        languageCode: "",
+      }),
+    },
+  );
+  if (!startRes.ok) {
+    const text = await startRes.text().catch(() => "");
+    throw new Error(`Apify Google search start error ${startRes.status}: ${text.substring(0, 200)}`);
+  }
+  const runData = await startRes.json() as { data?: { id?: string; status?: string; defaultDatasetId?: string } };
+  const run = runData.data;
+  if (!run?.id) throw new Error("Apify Google search: no run ID returned");
+
+  let datasetId = run.defaultDatasetId;
+  if (run.status !== "SUCCEEDED" && run.status !== "FAILED") {
+    const pollRes = await fetch(
+      `https://api.apify.com/v2/actor-runs/${run.id}?token=${apiToken}&waitForFinish=60`,
+    );
+    if (pollRes.ok) {
+      const pollData = await pollRes.json() as { data?: { status?: string; defaultDatasetId?: string } };
+      if (pollData.data?.status === "FAILED" || pollData.data?.status === "ABORTED") {
+        throw new Error(`Apify Google search run ${pollData.data.status}`);
+      }
+      datasetId = pollData.data?.defaultDatasetId || datasetId;
+    }
+  } else if (run.status === "FAILED") {
+    throw new Error("Apify Google search run failed");
+  }
+
+  if (!datasetId) throw new Error("Apify Google search: no dataset ID");
+
+  const itemsRes = await fetch(
+    `https://api.apify.com/v2/datasets/${datasetId}/items?token=${apiToken}&limit=3`,
+  );
+  if (!itemsRes.ok) throw new Error(`Apify Google search dataset error ${itemsRes.status}`);
+  const items = (await itemsRes.json()) as { searchQuery?: { term?: string }; organicResults?: { title?: string; description?: string; url?: string }[] }[];
+
+  const parts: string[] = [];
+  for (const item of items) {
+    if (item.searchQuery?.term) parts.push(`\n[Search: ${item.searchQuery.term}]`);
+    for (const r of (item.organicResults || []).slice(0, 5)) {
+      parts.push(`- ${r.title || ""}: ${r.description || ""}`);
+    }
+  }
+  return parts.join("\n").substring(0, 2000);
+}
+
 // Load knowledge base documents for the project
 async function loadKnowledgeBase(databaseUrl: string, projectId: number, _userId: number): Promise<{ title: string; docType: string; content: string }[]> {
   const sql = getDb(databaseUrl);
@@ -194,11 +307,15 @@ async function loadKnowledgeBase(databaseUrl: string, projectId: number, _userId
 // Task 0: Define ICP and qualification criteria using Knowledge Base
 async function defineICP(env: Env, agentId: number, projectDesc: string, website: string, projectName: string, projectId: number, userId: number, preferredModel = "auto", langHint = "") {
   await updateTaskStatus(env.DATABASE_URL, agentId, 0, "in_progress");
+  await clearSteps(env.DATABASE_URL, agentId, 0);
 
   const sources: string[] = [];
+  // Collect per-step findings for the final report
+  const stepFindings: { step: string; detail: string }[] = [];
   let kbContext = "";
 
   // 1. Load knowledge base documents
+  await logStep(env.DATABASE_URL, agentId, 0, "load_kb", "running");
   try {
     const kbResources = await loadKnowledgeBase(env.DATABASE_URL, projectId, userId);
     if (kbResources.length > 0) {
@@ -213,22 +330,32 @@ async function defineICP(env: Env, agentId: number, projectDesc: string, website
       }
       kbContext = "\n\n--- Knowledge Base Resources ---\n";
       let charBudget = 3000;
+      const kbTitles: string[] = [];
       for (const [title, doc] of docMap) {
         const fullContent = doc.chunks.join("\n");
         const truncated = fullContent.substring(0, Math.min(fullContent.length, charBudget));
         kbContext += `\n**[${doc.docType.toUpperCase()}] ${title}:**\n${truncated}\n`;
         charBudget -= truncated.length;
         sources.push(`kb: ${title} (${doc.docType})`);
+        kbTitles.push(`${title} (${doc.docType})`);
         if (charBudget <= 0) break;
       }
+      const kbDetail = `Loaded ${kbResources.length} docs: ${kbTitles.join(", ")}`;
+      stepFindings.push({ step: "Knowledge Base", detail: kbDetail });
+      await logStep(env.DATABASE_URL, agentId, 0, "load_kb", "done", kbDetail);
+    } else {
+      stepFindings.push({ step: "Knowledge Base", detail: "No documents found" });
+      await logStep(env.DATABASE_URL, agentId, 0, "load_kb", "done", "0 docs");
     }
   } catch (e) {
     console.error("KB load error:", e);
+    stepFindings.push({ step: "Knowledge Base", detail: `Error: ${e}` });
   }
 
-  // 2. Fetch website for additional context
+  // 2. Fetch website for additional context (with Apify fallback for JS-rendered sites)
   let websiteContext = "";
   if (website) {
+    await logStep(env.DATABASE_URL, agentId, 0, "fetch_website", "running", website);
     try {
       const res = await fetch(website, {
         headers: { "User-Agent": "AutoClaw-ICP-Bot/1.0" },
@@ -245,19 +372,90 @@ async function defineICP(env: Env, agentId: number, projectDesc: string, website
           .replace(/\s+/g, " ")
           .trim()
           .substring(0, 1000);
-        websiteContext = `\n\n--- Website (${website}) ---\n`;
-        if (titleMatch?.[1]) websiteContext += `Title: ${titleMatch[1].trim()}\n`;
-        if (metaDescMatch?.[1]) websiteContext += `Description: ${metaDescMatch[1].trim()}\n`;
-        websiteContext += `Content: ${bodyText.substring(0, 600)}\n`;
-        sources.push(`website: ${website}`);
+
+        // Check if basic fetch returned meaningful content (SPA sites often return near-empty HTML)
+        if (bodyText.length > 100) {
+          websiteContext = `\n\n--- Website (${website}) ---\n`;
+          if (titleMatch?.[1]) websiteContext += `Title: ${titleMatch[1].trim()}\n`;
+          if (metaDescMatch?.[1]) websiteContext += `Description: ${metaDescMatch[1].trim()}\n`;
+          websiteContext += `Content: ${bodyText.substring(0, 600)}\n`;
+          sources.push(`website: ${website}`);
+          const siteTitle = titleMatch?.[1]?.trim() || "";
+          const siteDesc = metaDescMatch?.[1]?.trim() || "";
+          stepFindings.push({ step: "Website Fetch", detail: `Direct fetch OK (${bodyText.length} chars). Title: "${siteTitle}". Description: "${siteDesc}"` });
+        } else if (env.APIFY_API_TOKEN) {
+          // Basic fetch returned near-empty content — use Apify Website Content Crawler
+          await logStep(env.DATABASE_URL, agentId, 0, "fetch_website", "running", "SPA detected, using Apify crawler");
+          const crawledContent = await crawlWebsiteApify(env.APIFY_API_TOKEN, website);
+          if (crawledContent.length > 50) {
+            websiteContext = `\n\n--- Website (${website}, crawled via Apify) ---\n${crawledContent}\n`;
+            sources.push(`website: ${website} (apify-crawled)`);
+            stepFindings.push({ step: "Website Fetch", detail: `SPA detected (basic fetch ${bodyText.length} chars). Apify crawler extracted ${crawledContent.length} chars:\n${crawledContent.substring(0, 500)}` });
+          } else {
+            stepFindings.push({ step: "Website Fetch", detail: `SPA detected. Apify crawler also returned minimal content (${crawledContent.length} chars)` });
+          }
+        } else {
+          stepFindings.push({ step: "Website Fetch", detail: `SPA detected (basic fetch ${bodyText.length} chars). No Apify token to try JS rendering.` });
+        }
       }
-    } catch { /* skip */ }
+      await logStep(env.DATABASE_URL, agentId, 0, "fetch_website", "done");
+    } catch {
+      // If basic fetch fails entirely and Apify is available, try crawling
+      if (env.APIFY_API_TOKEN) {
+        try {
+          const crawledContent = await crawlWebsiteApify(env.APIFY_API_TOKEN, website);
+          if (crawledContent.length > 50) {
+            websiteContext = `\n\n--- Website (${website}, crawled via Apify) ---\n${crawledContent}\n`;
+            sources.push(`website: ${website} (apify-crawled)`);
+            stepFindings.push({ step: "Website Fetch", detail: `Direct fetch failed. Apify fallback extracted ${crawledContent.length} chars:\n${crawledContent.substring(0, 500)}` });
+          } else {
+            stepFindings.push({ step: "Website Fetch", detail: "Direct fetch failed. Apify fallback also returned minimal content." });
+          }
+        } catch (crawlErr) {
+          console.error("Apify crawl fallback also failed:", crawlErr);
+          stepFindings.push({ step: "Website Fetch", detail: `Direct fetch failed. Apify fallback also failed: ${crawlErr}` });
+        }
+      }
+      if (!websiteContext) {
+        await logStep(env.DATABASE_URL, agentId, 0, "fetch_website", "error", "Failed to fetch");
+        if (!stepFindings.some(f => f.step === "Website Fetch")) {
+          stepFindings.push({ step: "Website Fetch", detail: "Failed to fetch website content" });
+        }
+      }
+    }
+  }
+
+  // 3. Google Search for additional company context (Apify)
+  let searchContext = "";
+  if (env.APIFY_API_TOKEN && projectName) {
+    await logStep(env.DATABASE_URL, agentId, 0, "search_company", "running", projectName);
+    try {
+      const domain = website ? new URL(website).hostname.replace("www.", "") : "";
+      const queries = [
+        `"${projectName}" company`,
+        domain ? `site:${domain} OR "${domain}" products services` : `"${projectName}" products services`,
+      ];
+      const searchResults = await searchGoogleApify(env.APIFY_API_TOKEN, queries);
+      if (searchResults.length > 50) {
+        searchContext = `\n\n--- Google Search Results ---\n${searchResults}\n`;
+        sources.push("google search (apify)");
+      }
+      const searchDetail = searchResults.length > 50
+        ? `Queries: ${queries.join(" | ")}\nResults (${searchResults.length} chars):\n${searchResults.substring(0, 800)}`
+        : `Queries: ${queries.join(" | ")}\nNo meaningful results found (${searchResults.length} chars)`;
+      stepFindings.push({ step: "Google Search", detail: searchDetail });
+      await logStep(env.DATABASE_URL, agentId, 0, "search_company", "done", searchDetail.substring(0, 200));
+    } catch (e) {
+      console.error("Apify Google search failed:", e);
+      stepFindings.push({ step: "Google Search", detail: `Failed: ${e}` });
+      await logStep(env.DATABASE_URL, agentId, 0, "search_company", "error", `${e}`);
+    }
   }
 
   if (projectName) sources.push(`project name: ${projectName}`);
   if (projectDesc) sources.push(`project description`);
 
-  if (!projectDesc && !kbContext && !websiteContext) {
+  if (!projectDesc && !kbContext && !websiteContext && !searchContext) {
     const msg = "No data available. Please add documents to the Knowledge Base, or set a website and description in the project settings.";
     await updateTaskStatus(env.DATABASE_URL, agentId, 0, "completed", msg);
     await saveReport(env.DATABASE_URL, agentId, "ICP Definition", msg, {
@@ -274,8 +472,9 @@ async function defineICP(env: Env, agentId: number, projectDesc: string, website
 **Business Description:** ${projectDesc || "N/A"}
 ${kbContext}
 ${websiteContext}
+${searchContext}
 
-Based on ALL the above data (especially the Knowledge Base resources), provide:
+Based on ALL the above data (especially the Knowledge Base resources and search results), provide:
 1. **Target Industries** (3-5 industries with reasoning based on the actual business)
 2. **Company Size** (employee count range, revenue range)
 3. **Geography** (target regions/countries)
@@ -292,10 +491,13 @@ Format as structured text with clear headings.
 ${langHint}`;
 
   try {
+    await logStep(env.DATABASE_URL, agentId, 0, "ai_analyze", "running", preferredModel);
     const { content: icpContent, model } = await cerebrasCompletionWithMeta(env, prompt, 1500, preferredModel);
+    await logStep(env.DATABASE_URL, agentId, 0, "ai_analyze", "done", model);
 
     // Extract search criteria (target_domains, keywords, etc.) from the ICP output — this has
     // the best context about target industries, company examples, and geography.
+    await logStep(env.DATABASE_URL, agentId, 0, "extract_criteria", "running");
     const criteria = await extractSearchCriteria(env, icpContent + "\n\nProject: " + projectName + "\n" + projectDesc, kbContext, preferredModel);
     if (criteria.target_domains.length > 0 || criteria.keywords.length > 0) {
       try {
@@ -314,21 +516,41 @@ ${langHint}`;
       }
     }
 
+    await logStep(env.DATABASE_URL, agentId, 0, "extract_criteria", "done", `${criteria.target_domains.length} domains, ${criteria.keywords.length} keywords`);
+
+    // Add criteria extraction to step findings
+    stepFindings.push({
+      step: "Search Criteria Extraction",
+      detail: `Industries: ${criteria.industries.join(", ") || "none"}\nJob Titles: ${criteria.job_titles.join(", ") || "none"}\nKeywords: ${criteria.keywords.join(", ") || "none"}\nTarget Domains: ${criteria.target_domains.join(", ") || "none"}`,
+    });
+
+    await logStep(env.DATABASE_URL, agentId, 0, "save_result", "running");
+
+    // Build full result with step-by-step findings appended
+    const findingsSection = stepFindings.map(f => `### ${f.step}\n${f.detail}`).join("\n\n");
+    let resultWithDomains = icpContent;
+    if (criteria.target_domains.length > 0) {
+      resultWithDomains += `\n\n---\n**Auto-configured target domains:** ${criteria.target_domains.join(", ")}\n**Search keywords:** ${criteria.keywords.join(", ")}`;
+    }
+    resultWithDomains += `\n\n---\n## Data Collection Details\n\n${findingsSection}`;
+
     const summary = `Defined ICP using ${sources.length} sources: ${sources.join(", ")}`;
-    const resultWithDomains = criteria.target_domains.length > 0
-      ? icpContent + `\n\n---\n**Auto-configured target domains:** ${criteria.target_domains.join(", ")}\n**Search keywords:** ${criteria.keywords.join(", ")}`
-      : icpContent;
     await updateTaskStatus(env.DATABASE_URL, agentId, 0, "completed", resultWithDomains);
     await saveReport(env.DATABASE_URL, agentId, "ICP Definition", summary, withModelMetrics({
       sources: sources.join(", "),
       kb_documents_used: sources.filter(s => s.startsWith("kb:")).length,
       website_analyzed: website || "none",
+      website_method: sources.some(s => s.includes("apify-crawled")) ? "apify-crawler" : sources.some(s => s.startsWith("website:")) ? "direct-fetch" : "none",
+      google_search_used: sources.includes("google search (apify)") ? "yes" : "no",
       target_domains_found: criteria.target_domains.length,
+      step_findings_json: JSON.stringify(stepFindings),
     }, preferredModel, model));
+    await logStep(env.DATABASE_URL, agentId, 0, "save_result", "done");
 
     return { icp: icpContent, target_domains: criteria.target_domains };
   } catch (e) {
     const msg = `ICP definition failed: ${e}`;
+    await logStep(env.DATABASE_URL, agentId, 0, "ai_analyze", "error", msg);
     await failTask(env.DATABASE_URL, agentId, 0, "ICP Definition", msg, preferredModel);
     return { error: msg };
   }
@@ -350,7 +572,7 @@ async function setupDataSources(env: Env, agentId: number) {
       const body = await res.text().catch(() => "");
       // Apollo returns {"is_logged_in": true} on success
       if (res.ok && body.includes("is_logged_in")) {
-        sources.push({ name: "Apollo", configured: true, status: "verified", error: "Free plan may not support people search (403). Enrichment always works." });
+        sources.push({ name: "Apollo", configured: true, status: "verified", error: "Free plan: people search limited, enrichment works. Upgrade for full search." });
       } else {
         sources.push({ name: "Apollo", configured: true, status: "error", error: `API returned ${res.status}: ${body.substring(0, 100)}` });
       }

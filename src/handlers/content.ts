@@ -259,17 +259,100 @@ ${langHint}`;
   }
 }
 
-// Task 1: Publish to backlink platforms (future)
+// Task 1: Generate backlink strategy and article drafts for SEO platforms
 async function publishBacklinks(env: Env, agentId: number, config: ContentConfig) {
   await updateTaskStatus(env.DATABASE_URL, agentId, 1, "in_progress");
 
-  // TODO: integrate with xpilot SEO backlinks skill
-  // - Blogger, Medium, Dev.to, Telegra.ph, WordPress
-  // - Each post links back to {brand_domain}/blog/[id]
+  const { brandName, brandDomain, contactPhone, audience, marketRegion } = getContentProfile(env, config);
+  const userLocale = (config.locale as string) || "en";
+  const langHint = localeInstruction(userLocale);
 
-  const summary = "Backlink publishing: not yet implemented";
-  await updateTaskStatus(env.DATABASE_URL, agentId, 1, "completed", summary);
-  return { status: "pending_implementation" };
+  // Determine topic context based on current week (same as article generation)
+  const weekNumber = Math.floor(Date.now() / (7 * 24 * 60 * 60 * 1000));
+  const { theme, angle } = pickTopic(weekNumber);
+
+  const platforms = ["Blogger", "Medium", "Dev.to", "Telegra.ph", "WordPress"];
+
+  const prompt = `You are an SEO backlink strategist for ${brandName} (${brandDomain}), serving ${audience} in ${marketRegion}.
+
+Generate a backlink strategy and ready-to-publish article drafts for the following platforms: ${platforms.join(", ")}.
+
+Context:
+- Current content theme: ${theme}
+- Current angle: ${angle}
+- Target backlink URL: https://${brandDomain}/blog
+- Contact: ${contactPhone}
+
+For EACH platform, provide:
+
+1. **Platform name**
+2. **Article title** — optimized for SEO on that specific platform
+3. **Article body** (300-500 words) — unique content per platform, NOT a copy-paste. Adapt tone and format to match platform culture:
+   - Blogger: casual, personal storytelling with embedded links
+   - Medium: thought-leadership style, data-driven insights
+   - Dev.to: technical/practical tips, markdown-friendly
+   - Telegra.ph: concise, scannable, news-style
+   - WordPress: comprehensive guide format with subheadings
+4. **SEO tags/keywords** — 5-8 relevant tags for that platform
+5. **Anchor text suggestion** — the natural anchor text linking back to ${brandDomain}
+
+Requirements:
+- Each article must contain exactly ONE natural backlink to https://${brandDomain}/blog using the suggested anchor text
+- Content must be unique across platforms to avoid duplicate content penalties
+- Titles should include relevant long-tail keywords
+- Tone should match the ${theme} topic while promoting ${brandName} services naturally
+
+Output format — use this exact structure for each platform:
+
+=== PLATFORM: [name] ===
+TITLE: [title]
+TAGS: [comma-separated tags]
+ANCHOR_TEXT: [suggested anchor text]
+---
+[article body with the backlink naturally embedded]
+===
+
+${langHint}`;
+
+  try {
+    const preferredModel = String(config.model || "auto");
+    const { content, model } = await claudeCompletionWithMeta(env, prompt, 4000, preferredModel);
+
+    // Parse platform sections from the response
+    const platformSections = content.split(/===\s*PLATFORM:\s*/i).filter(Boolean);
+    const drafts: { platform: string; title: string; tags: string; wordCount: number }[] = [];
+
+    for (const section of platformSections) {
+      const nameMatch = section.match(/^([^\n=]+)/);
+      const titleMatch = section.match(/TITLE:\s*(.+)/i);
+      const tagsMatch = section.match(/TAGS:\s*(.+)/i);
+      const platform = nameMatch?.[1]?.replace(/\s*===\s*$/, "").trim() || "Unknown";
+      const title = titleMatch?.[1]?.trim() || "Untitled";
+      const tags = tagsMatch?.[1]?.trim() || "";
+      const wordCount = section.split(/\s+/).length;
+
+      drafts.push({ platform, title, tags, wordCount });
+    }
+
+    const totalWords = drafts.reduce((sum, d) => sum + d.wordCount, 0);
+    const summary = `Generated ${drafts.length} backlink article drafts (${totalWords} total words) for: ${drafts.map(d => d.platform).join(", ")}`;
+
+    await updateTaskStatus(env.DATABASE_URL, agentId, 1, "completed", summary);
+    await saveReport(env.DATABASE_URL, agentId, "Backlink Strategy", summary, withModelMetrics({
+      platforms_count: drafts.length,
+      total_word_count: totalWords,
+      theme,
+      angle,
+      target_url: `https://${brandDomain}/blog`,
+      platforms: drafts.map(d => d.platform).join(", "),
+    }, preferredModel, model));
+
+    return { drafts, theme, angle, totalWords };
+  } catch (e) {
+    const msg = `Backlink strategy generation failed: ${e}`;
+    await failTask(env.DATABASE_URL, agentId, 1, "Backlink Strategy", msg, "auto");
+    return { error: msg };
+  }
 }
 
 export async function handleContent(

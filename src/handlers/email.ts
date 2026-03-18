@@ -1,4 +1,4 @@
-import { updateTaskStatus, saveReport, getDb, withModelMetrics, failTask } from "../lib/db";
+import { updateTaskStatus, saveReport, getDb, withModelMetrics, failTask, logStep, clearSteps } from "../lib/db";
 import { cerebrasCompletionWithMeta, claudeCompletionWithMeta } from "../lib/ai";
 import { localeInstruction } from "../lib/locale";
 
@@ -11,155 +11,56 @@ interface Env {
   CEREBRAS_API_KEY?: string;
 }
 
-interface KBResource {
-  title: string;
-  docType: string;
-  content: string;
-}
-
-// Load knowledge base documents for the project (direct DB query, no embedding needed)
-async function loadKnowledgeBase(databaseUrl: string, projectId: number, userId: number): Promise<KBResource[]> {
-  const sql = getDb(databaseUrl);
-  const rows = await sql`
-    SELECT d.title, d.doc_type, c.content
-    FROM kb_chunks c
-    JOIN kb_documents d ON c.document_id = d.id
-    WHERE d.status = 'ready'
-      AND c.content IS NOT NULL
-      AND (
-        (d.scope = 'project' AND d.project_id = ${projectId})
-        OR (d.scope = 'personal' AND d.user_id = ${userId})
-      )
-    ORDER BY d.id, c.chunk_index
-    LIMIT 50
-  `;
-  return rows.map((r) => ({
-    title: r.title as string,
-    docType: r.doc_type as string,
-    content: r.content as string,
-  }));
-}
-
-// Task 0: Research target audience & ICP
-async function researchICP(env: Env, agentId: number, projectDesc: string, website: string, projectName: string, projectId: number, userId: number, preferredModel = "auto", langHint = "") {
+// Task 0: Reuse ICP from Lead Prospecting agent (if available), otherwise mark as needing it
+async function researchICP(env: Env, agentId: number, _projectDesc: string, _website: string, _projectName: string, projectId: number, _userId: number, _preferredModel = "auto", _langHint = "") {
   await updateTaskStatus(env.DATABASE_URL, agentId, 0, "in_progress");
+  await clearSteps(env.DATABASE_URL, agentId, 0);
 
-  const sources: string[] = [];
-  let websiteContext = "";
-  let kbContext = "";
+  await logStep(env.DATABASE_URL, agentId, 0, "check_icp", "running");
 
-  // 1. Load knowledge base documents for the project
-  try {
-    const kbResources = await loadKnowledgeBase(env.DATABASE_URL, projectId, userId);
-    if (kbResources.length > 0) {
-      // Group by document title, concatenate chunks
-      const docMap = new Map<string, { docType: string; chunks: string[] }>();
-      for (const r of kbResources) {
-        const existing = docMap.get(r.title);
-        if (existing) {
-          existing.chunks.push(r.content);
-        } else {
-          docMap.set(r.title, { docType: r.docType, chunks: [r.content] });
-        }
-      }
-      kbContext = "\n\n--- Knowledge Base Resources ---\n";
-      let charBudget = 3000;
-      for (const [title, doc] of docMap) {
-        const fullContent = doc.chunks.join("\n");
-        const truncated = fullContent.substring(0, Math.min(fullContent.length, charBudget));
-        kbContext += `\n**[${doc.docType.toUpperCase()}] ${title}:**\n${truncated}\n`;
-        charBudget -= truncated.length;
-        sources.push(`kb: ${title} (${doc.docType})`);
-        if (charBudget <= 0) break;
-      }
-    }
-  } catch (e) {
-    console.error("KB load error:", e);
-  }
+  const sql = getDb(env.DATABASE_URL);
 
-  // 2. Fetch website content for additional context
-  if (website) {
-    try {
-      const res = await fetch(website, {
-        headers: { "User-Agent": "AutoClaw-ICP-Bot/1.0" },
-        redirect: "follow",
+  // Look for a completed ICP from the lead_prospecting agent on the same project
+  const icpRows = await sql`
+    SELECT aa.config
+    FROM agent_assignments aa
+    WHERE aa.project_id = ${projectId}
+      AND aa.agent_type = 'lead_prospecting'
+      AND aa.status = 'active'
+    ORDER BY aa.id DESC
+    LIMIT 1
+  `;
+
+  if (icpRows.length > 0) {
+    const lpConfig = icpRows[0].config as Record<string, unknown>;
+    const tasks = lpConfig.tasks as { status?: string; result?: string }[] | undefined;
+    const icpTask = tasks?.[0]; // Task 0 in lead_prospecting is ICP definition
+
+    if (icpTask?.status === "completed" && icpTask.result) {
+      await logStep(env.DATABASE_URL, agentId, 0, "check_icp", "done", "Reused from Lead Prospecting");
+
+      await updateTaskStatus(env.DATABASE_URL, agentId, 0, "completed", icpTask.result);
+      await saveReport(env.DATABASE_URL, agentId, "ICP Research", "Reused ICP definition from Lead Prospecting agent", {
+        sources: "lead_prospecting_agent",
+        model_used: "none (reused)",
+        preferred_model: "none",
+        reused_from: "lead_prospecting",
       });
-      if (res.ok) {
-        const html = await res.text();
-        const titleMatch = html.match(/<title[^>]*>(.*?)<\/title>/is);
-        const metaDescMatch = html.match(/<meta\s+name=["']description["']\s+content=["'](.*?)["']/is);
-        const h1s = (html.match(/<h1[^>]*>(.*?)<\/h1>/gis) || []).map(h => h.replace(/<[^>]*>/g, "").trim()).filter(Boolean);
-        const h2s = (html.match(/<h2[^>]*>(.*?)<\/h2>/gis) || []).map(h => h.replace(/<[^>]*>/g, "").trim()).filter(Boolean);
-        const bodyText = html
-          .replace(/<script[\s\S]*?<\/script>/gi, "")
-          .replace(/<style[\s\S]*?<\/style>/gi, "")
-          .replace(/<[^>]*>/g, " ")
-          .replace(/\s+/g, " ")
-          .trim()
-          .substring(0, 1500);
-
-        websiteContext = `\n\n--- Website Analysis (${website}) ---\n`;
-        if (titleMatch?.[1]) websiteContext += `Title: ${titleMatch[1].trim()}\n`;
-        if (metaDescMatch?.[1]) websiteContext += `Meta Description: ${metaDescMatch[1].trim()}\n`;
-        if (h1s.length > 0) websiteContext += `H1 Headlines: ${h1s.join("; ")}\n`;
-        if (h2s.length > 0) websiteContext += `H2 Headlines: ${h2s.slice(0, 10).join("; ")}\n`;
-        websiteContext += `Page Content Preview: ${bodyText.substring(0, 800)}\n`;
-        sources.push(`website: ${website}`);
-      }
-    } catch { /* website fetch failed, continue without it */ }
+      return { icp: icpTask.result };
+    }
   }
 
-  if (projectName) sources.push(`project name: ${projectName}`);
-  if (projectDesc) sources.push(`project description`);
+  // No lead_prospecting ICP available
+  await logStep(env.DATABASE_URL, agentId, 0, "check_icp", "done", "No existing ICP found");
 
-  if (!projectDesc && !websiteContext && !kbContext) {
-    const msg = "No data available. Please add documents to the Knowledge Base, or set a website and description in the project settings.";
-    await updateTaskStatus(env.DATABASE_URL, agentId, 0, "completed", msg);
-    await saveReport(env.DATABASE_URL, agentId, "ICP Research", msg, {
-      sources: "none",
-      model_used: "none",
-      preferred_model: "none",
-    });
-    return { error: msg };
-  }
-
-  const prompt = `You are a B2B marketing expert. Research and define an Ideal Customer Profile (ICP) based on the following real business data:
-
-**Business Name:** ${projectName || "N/A"}
-**Business Description:** ${projectDesc || "N/A"}
-${kbContext}
-${websiteContext}
-
-Based on ALL the above information (especially the Knowledge Base resources), provide:
-1. **Target Industries** (3-5 with reasoning referencing the actual business data above)
-2. **Company Size Range** (employee count + revenue estimate)
-3. **Key Job Titles to Target** (5-8 decision makers)
-4. **Pain Points This Product Solves** (3-5 specific problems, cite the KB/website content)
-5. **Recommended Outreach Channels** (ranked by expected ROI)
-6. **Buyer Persona Summary** (1-2 paragraph description of ideal buyer)
-
-IMPORTANT: Be specific and reference the actual product/service details from the knowledge base and website above. Do NOT generate generic advice.
-Format as structured text with clear headings.
-${langHint}`;
-
-  try {
-    const { content: icpContent, model } = await cerebrasCompletionWithMeta(env, prompt, 1500, preferredModel);
-
-    const summary = `Completed ICP research using ${sources.length} sources: ${sources.join(", ")}`;
-    await updateTaskStatus(env.DATABASE_URL, agentId, 0, "completed", icpContent);
-    await saveReport(env.DATABASE_URL, agentId, "ICP Research", summary, withModelMetrics({
-      sources: sources.join(", "),
-      website_analyzed: website || "none",
-      project_name: projectName || "N/A",
-      kb_documents_used: sources.filter(s => s.startsWith("kb:")).length,
-    }, preferredModel, model));
-
-    return { icp: icpContent };
-  } catch (e) {
-    const msg = `ICP research failed: ${e}`;
-    await failTask(env.DATABASE_URL, agentId, 0, "ICP Research", msg, preferredModel);
-    return { error: msg };
-  }
+  const msg = "No ICP definition found. Please activate and run the Lead Prospecting agent first — its ICP results will be automatically reused here.";
+  await updateTaskStatus(env.DATABASE_URL, agentId, 0, "completed", msg);
+  await saveReport(env.DATABASE_URL, agentId, "ICP Research", msg, {
+    sources: "none",
+    model_used: "none",
+    preferred_model: "none",
+  });
+  return { error: msg };
 }
 
 // Task 2: Create email templates
@@ -516,9 +417,11 @@ const BATCH_SIZE_FIRST_CAMPAIGN = 25;
 // Task 5: Launch outreach campaign — actually sends emails via Brevo/SendGrid
 async function launchOutreach(env: Env, agentId: number, projectId: number, userId: number, projectDesc: string, website: string, preferredModel = "auto", langHint = "") {
   await updateTaskStatus(env.DATABASE_URL, agentId, 5, "in_progress");
+  await clearSteps(env.DATABASE_URL, agentId, 5);
 
   const sql = getDb(env.DATABASE_URL);
   const provider = env.SENDGRID_API_KEY ? "SendGrid" : env.BREVO_API_KEY ? "Brevo" : "none";
+  await logStep(env.DATABASE_URL, agentId, 5, "check_provider", "done", provider !== "none" ? provider : "none found");
 
   // 1. Get sender info — prefer agent config, then project owner
   const agentConfig = await sql`SELECT config FROM agent_assignments WHERE id = ${agentId}`;
@@ -533,12 +436,14 @@ async function launchOutreach(env: Env, agentId: number, projectId: number, user
   const projectDomain = (projectInfo[0]?.domain as string) || "";
 
   // 2. Retrieve email template from Task 2 result
+  await logStep(env.DATABASE_URL, agentId, 5, "load_template", "running");
   const agents = await sql`SELECT config FROM agent_assignments WHERE id = ${agentId}`;
   const config = agents[0]?.config as { tasks?: { result?: string }[] } | undefined;
   const templateResult = config?.tasks?.[2]?.result || "";
   const template = parseFirstTemplate(templateResult);
 
   if (!template) {
+    await logStep(env.DATABASE_URL, agentId, 5, "load_template", "error", "No template found");
     const msg = "Could not parse email template from Task 2. Please re-run the Email Templates task first.";
     await updateTaskStatus(env.DATABASE_URL, agentId, 5, "completed", msg);
     await saveReport(env.DATABASE_URL, agentId, "Campaign Launch", msg, {
@@ -556,14 +461,65 @@ async function launchOutreach(env: Env, agentId: number, projectId: number, user
     return { error: msg };
   }
 
+  // 2b. Throttle — enforce minimum interval between batches (default 2 hours)
+  const minIntervalHours = Number(agentCfg.min_send_interval_hours || 2);
+  try {
+    const lastSent = await sql`
+      SELECT MAX(created_at) as last_sent FROM email_logs
+      WHERE lead_id IN (SELECT id FROM leads WHERE project_id = ${projectId})
+        AND status = 'sent'
+    `;
+    if (lastSent[0]?.last_sent) {
+      const hoursSince = (Date.now() - new Date(lastSent[0].last_sent as string).getTime()) / (1000 * 60 * 60);
+      if (hoursSince < minIntervalHours) {
+        const msg = `Throttled: last batch sent ${hoursSince.toFixed(1)}h ago (min interval: ${minIntervalHours}h). Will retry next cron cycle.`;
+        await updateTaskStatus(env.DATABASE_URL, agentId, 5, "completed", msg);
+        const totalUnsent = await sql`SELECT COUNT(*)::int as count FROM leads WHERE project_id = ${projectId} AND email_sent = false`;
+        return { sent: 0, failed: 0, provider, remaining: (totalUnsent[0]?.count as number) || 0 };
+      }
+    }
+  } catch { /* non-critical — proceed if check fails */ }
+
+  // 2c. Daily send cap (default 100)
+  const dailySendCap = Number(agentCfg.daily_send_cap || 100);
+  let sentToday = 0;
+  try {
+    const todaySent = await sql`
+      SELECT COUNT(*)::int as count FROM email_logs
+      WHERE lead_id IN (SELECT id FROM leads WHERE project_id = ${projectId})
+        AND status = 'sent'
+        AND created_at >= CURRENT_DATE
+    `;
+    sentToday = (todaySent[0]?.count as number) || 0;
+  } catch { /* non-critical */ }
+
+  if (sentToday >= dailySendCap) {
+    const msg = `Daily send cap reached (${sentToday}/${dailySendCap}). Will resume tomorrow.`;
+    await updateTaskStatus(env.DATABASE_URL, agentId, 5, "completed", msg);
+    await saveReport(env.DATABASE_URL, agentId, "Campaign Launch", msg, {
+      model_used: "none", preferred_model: preferredModel,
+      daily_cap: dailySendCap, sent_today: sentToday,
+    });
+    const totalUnsent = await sql`SELECT COUNT(*)::int as count FROM leads WHERE project_id = ${projectId} AND email_sent = false`;
+    return { sent: 0, failed: 0, provider, remaining: (totalUnsent[0]?.count as number) || 0 };
+  }
+
+  // Effective batch size respects daily cap remaining budget
+  const remainingBudget = dailySendCap - sentToday;
+  const effectiveBatchSize = Math.min(BATCH_SIZE_FIRST_CAMPAIGN, remainingBudget);
+
   // 3. Get unsent leads (first batch)
+  await logStep(env.DATABASE_URL, agentId, 5, "load_template", "done");
+  await logStep(env.DATABASE_URL, agentId, 5, "fetch_leads", "running");
   const leads = await sql`
     SELECT id, email, first_name, last_name, company
     FROM leads
     WHERE project_id = ${projectId} AND email_sent = false
     ORDER BY id
-    LIMIT ${BATCH_SIZE_FIRST_CAMPAIGN}
+    LIMIT ${effectiveBatchSize}
   `;
+
+  await logStep(env.DATABASE_URL, agentId, 5, "fetch_leads", "done", `${leads.length} unsent leads`);
 
   if (leads.length === 0) {
     const msg = "No unsent leads found. All leads have already been emailed, or no leads exist for this project.";
@@ -575,6 +531,7 @@ async function launchOutreach(env: Env, agentId: number, projectId: number, user
   }
 
   // 4. Send emails
+  await logStep(env.DATABASE_URL, agentId, 5, "sending_emails", "running", `0/${leads.length}`);
   let sent = 0;
   let failed = 0;
   const sentDetails: { email: string; name: string; company: string; subject: string; status: string; messageId?: string }[] = [];
@@ -671,6 +628,9 @@ async function launchOutreach(env: Env, agentId: number, projectId: number, user
     }
   } catch { /* non-critical */ }
 
+  await logStep(env.DATABASE_URL, agentId, 5, "sending_emails", "done", `${sent} sent, ${failed} failed`);
+  await logStep(env.DATABASE_URL, agentId, 5, "save_report", "running");
+
   // 6. Build detailed report
   let report = `## Campaign Launch Report\n\n`;
   report += `**Provider:** ${provider}\n`;
@@ -711,6 +671,7 @@ async function launchOutreach(env: Env, agentId: number, projectId: number, user
     provider,
   }, preferredModel, "none"));
 
+  await logStep(env.DATABASE_URL, agentId, 5, "save_report", "done");
   return { sent, failed, provider, remaining };
 }
 
