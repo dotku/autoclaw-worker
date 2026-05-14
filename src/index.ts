@@ -18,6 +18,10 @@ export interface Env {
   SNOV_API_SECRET?: string;
   APOLLO_API_KEY?: string;
   APIFY_API_TOKEN?: string;
+  TAVILY_API_KEY?: string;
+  FIRECRAWL_API_KEY?: string;
+  XAI_API_KEY?: string;
+  GLM_API_KEY?: string;
   BREVO_API_KEY?: string;
   SENDGRID_API_KEY?: string;
   AI_GATEWAY_API_KEY?: string;
@@ -40,6 +44,11 @@ export interface Env {
   GITHUB_TOKEN?: string;
   // Self service binding — used by /run-all to chain tasks across invocations
   SELF?: Fetcher;
+  // Vercel cron migration — base URL of the Next.js app, plus the shared
+  // secret the autoclaw-web /api/cron/* routes require. Set both via
+  // `wrangler secret put`.
+  AUTOCLAW_WEB_URL?: string;
+  CRON_SECRET?: string;
 }
 
 interface TaskRequest {
@@ -109,6 +118,10 @@ async function resolveRuntimeEnv(
         if (svc === "brevo" && !runtimeEnv.BREVO_API_KEY) runtimeEnv.BREVO_API_KEY = decrypted;
         if (svc === "apollo" && !runtimeEnv.APOLLO_API_KEY) runtimeEnv.APOLLO_API_KEY = decrypted;
         if (svc === "apify" && !runtimeEnv.APIFY_API_TOKEN) runtimeEnv.APIFY_API_TOKEN = decrypted;
+        if (svc === "tavily" && !runtimeEnv.TAVILY_API_KEY) runtimeEnv.TAVILY_API_KEY = decrypted;
+        if (svc === "firecrawl" && !runtimeEnv.FIRECRAWL_API_KEY) runtimeEnv.FIRECRAWL_API_KEY = decrypted;
+        if ((svc === "xai" || svc === "z_ai") && !runtimeEnv.XAI_API_KEY) runtimeEnv.XAI_API_KEY = decrypted;
+        if ((svc === "glm" || svc === "zhipu" || svc === "z_ai") && !runtimeEnv.GLM_API_KEY) runtimeEnv.GLM_API_KEY = decrypted;
         if (svc === "hunter" && !runtimeEnv.HUNTER_API_KEY) runtimeEnv.HUNTER_API_KEY = decrypted;
         if (svc === "snov_api_id" && !runtimeEnv.SNOV_API_ID) runtimeEnv.SNOV_API_ID = decrypted;
         if (svc === "snov_api_secret" && !runtimeEnv.SNOV_API_SECRET) runtimeEnv.SNOV_API_SECRET = decrypted;
@@ -265,11 +278,11 @@ async function runCronBatch(env: Env, body: CronBody = {}): Promise<CronResult> 
           break;
         case "email_marketing": {
           const emailResult = await handleEmail(runtimeEnv, agentId, nextIdx, config, projectId, userId);
-          // Auto-reset Task 5 if there are remaining unsent leads for next cron cycle
-          if (nextIdx === 5 && emailResult && typeof emailResult === "object" && "remaining" in emailResult) {
+          // Auto-reset launch outreach task if there are remaining unsent leads for next cron cycle
+          if (nextIdx === 4 && emailResult && typeof emailResult === "object" && "remaining" in emailResult) {
             const remaining = (emailResult as { remaining?: number }).remaining || 0;
             if (remaining > 0) {
-              await resetTaskForRecurring(env.DATABASE_URL, agentId, 5);
+              await resetTaskForRecurring(env.DATABASE_URL, agentId, 4);
             }
           }
           break;
@@ -699,7 +712,69 @@ export default {
     return json({ error: "Not found" }, 404);
   },
 
-  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil(runCronBatch(env, { max_agents: 1 }));
+    // Vercel cron migration — hourly dispatcher fires the right autoclaw-web
+    // /api/cron/* endpoint(s) based on the UTC hour.
+    ctx.waitUntil(dispatchVercelCrons(env, controller.scheduledTime));
   },
 };
+
+/**
+ * Hourly dispatcher: replaces the cron jobs that previously ran on Vercel
+ * (`vercel.json` `crons`). One Cloudflare cron trigger (`0 * * * *`) fires
+ * this handler every hour; we look at the UTC hour to decide which Next.js
+ * cron endpoints to invoke.
+ *
+ *   every hour → google-ads-sync
+ *   02:00 UTC  → process-embeddings
+ *   03:00 UTC  → benchmark-models
+ *   04:00 UTC  → product-docs-rag
+ *   05:00 UTC  → google-ads-reconcile
+ *   06:00 UTC  → sync-email-stats
+ *   08:00 UTC  → run-agents
+ *
+ * The migration is HTTP-only — Cloudflare just calls the same Vercel routes
+ * the old Vercel crons would have called, so the Next.js logic stays put.
+ */
+async function dispatchVercelCrons(env: Env, scheduledTime: number): Promise<void> {
+  const baseUrl = env.AUTOCLAW_WEB_URL;
+  const secret = env.CRON_SECRET;
+  if (!baseUrl || !secret) {
+    console.warn("[cron-dispatch] AUTOCLAW_WEB_URL or CRON_SECRET not set — skipping");
+    return;
+  }
+
+  const fireDate = new Date(scheduledTime);
+  const hour = fireDate.getUTCHours();
+  const minute = fireDate.getUTCMinutes();
+
+  // Defensive: only at the top of the hour (the trigger schedules "0 * * * *",
+  // but Cloudflare may invoke a few seconds off).
+  if (minute > 5) return;
+
+  const jobs: string[] = ["google-ads-sync"];
+  const hourly: Record<number, string> = {
+    2: "process-embeddings",
+    3: "benchmark-models",
+    4: "product-docs-rag",
+    5: "google-ads-reconcile",
+    6: "sync-email-stats",
+    8: "run-agents",
+  };
+  if (hourly[hour]) jobs.push(hourly[hour]);
+
+  for (const job of jobs) {
+    try {
+      const url = `${baseUrl.replace(/\/$/, "")}/api/cron/${job}`;
+      const res = await fetch(url, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${secret}` },
+      });
+      const body = await res.text();
+      console.log(`[cron-dispatch] ${job} → HTTP ${res.status} ${body.slice(0, 200)}`);
+    } catch (e) {
+      console.error(`[cron-dispatch] ${job} failed:`, e);
+    }
+  }
+}

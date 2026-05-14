@@ -23,4 +23,15 @@ ENVIRONMENT = "development"
 binding = "SELF"
 service = "autoclaw-worker"
 
-# Scheduling is handled externally (for example GitHub Actions or Vercel cron).
+# Cron Triggers — replaces the Vercel `crons` block that was removed from
+# autoclaw-web/vercel.json (Hobby plan only allows daily; CF Free allows any
+# cadence). Single hourly trigger fans out to autoclaw-web /api/cron/* via
+# `dispatchVercelCrons` in src/index.ts based on UTC hour. To extend
+# behavior, edit that function — don't add more triggers here (CF Free is
+# capped at 3 per worker; one is plenty with internal routing).
+#
+# Required secrets (set with `wrangler secret put <KEY>`):
+#   - AUTOCLAW_WEB_URL   e.g. https://autoclaw.jytech.us
+#   - CRON_SECRET        same value as autoclaw-web's CRON_SECRET env var
+[triggers]
+crons = ["0 * * * *"]
